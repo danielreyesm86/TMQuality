@@ -329,7 +329,7 @@ def verificar_acceso():
         """
         <style>
         [data-testid="stAppViewContainer"] {
-            background: linear-gradient(180deg, #FFFFFF 0%, #F4F7F9 100%);
+            background: linear-gradient(180deg, var(--background-color) 0%, var(--secondary-background-color) 100%);
         }
         </style>
         """,
@@ -846,234 +846,121 @@ def aplicar_estilos():
     st.markdown(
         """
         <style>
+        /* TMQuality usa las variables nativas de Streamlit. De este modo
+           Light, Dark y System cambian toda la interfaz de forma real. */
         :root {
-            --tm-primary: #8F1D2C;
-            --tm-primary-dark: #6F1320;
-            --tm-accent: #C94A5B;
-            --tm-soft: #F8EEF0;
-            --tm-surface: #FFFFFF;
-            --tm-bg: #F5F7FA;
-            --tm-text: #24313A;
-            --tm-muted: #697780;
-            --tm-success: #21845A;
-            --tm-warning: #C77A16;
-            --tm-danger: #C0392B;
-            --tm-border: #E5E9ED;
+            --tm-primary: var(--primary-color, #A91F34);
+            --tm-bg: var(--background-color, #FFFFFF);
+            --tm-surface: var(--secondary-background-color, #F3F5F7);
+            --tm-text: var(--text-color, #17212B);
+            --tm-muted: color-mix(in srgb, var(--tm-text) 64%, transparent);
+            --tm-border: color-mix(in srgb, var(--tm-text) 16%, transparent);
+            --tm-shadow: 0 10px 30px color-mix(in srgb, #000 13%, transparent);
+            --tm-soft-primary: color-mix(in srgb, var(--tm-primary) 13%, var(--tm-surface));
+            --tm-success: #2E9D68;
+            --tm-warning: #E49A2D;
+            --tm-danger: #E05252;
         }
 
+        html, body, .stApp { color-scheme: light dark; }
         [data-testid="stAppViewContainer"] {
-            background: linear-gradient(180deg, #FBFCFD 0%, var(--tm-bg) 100%);
+            color: var(--tm-text);
+            background:
+                radial-gradient(circle at 85% 0%, color-mix(in srgb, var(--tm-primary) 8%, transparent), transparent 28rem),
+                linear-gradient(180deg, var(--tm-bg), color-mix(in srgb, var(--tm-bg) 88%, var(--tm-surface)));
         }
-        [data-testid="stHeader"] { background: rgba(255,255,255,0.88); }
+        [data-testid="stHeader"] {
+            background: color-mix(in srgb, var(--tm-bg) 86%, transparent);
+            backdrop-filter: blur(12px);
+        }
         [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #FFFFFF 0%, #F8F3F4 100%);
+            background: linear-gradient(180deg, var(--tm-bg), color-mix(in srgb, var(--tm-surface) 82%, var(--tm-bg)));
             border-right: 1px solid var(--tm-border);
         }
-        .block-container {
-            max-width: 1500px;
-            padding-top: 1.25rem;
-            padding-bottom: 3rem;
-        }
-        h1, h2, h3 { color: var(--tm-text); letter-spacing: -0.02em; }
-        div[data-testid="stMetric"] {
-            background: var(--tm-surface);
-            border: 1px solid var(--tm-border);
-            border-radius: 16px;
-            padding: 1rem 1.15rem;
-            box-shadow: 0 7px 24px rgba(32, 43, 53, 0.06);
-        }
-        div[data-testid="stMetric"] label { color: var(--tm-muted); }
-        div[data-testid="stMetricValue"] { color: var(--tm-text); }
-        div[data-testid="stForm"] {
-            background: var(--tm-surface);
-            border: 1px solid var(--tm-border);
-            border-radius: 18px;
-            padding: 1rem;
-            box-shadow: 0 8px 28px rgba(32, 43, 53, 0.05);
-        }
-        div[data-testid="stExpander"] {
-            border: 1px solid var(--tm-border);
-            border-radius: 14px;
-            background: rgba(255,255,255,0.78);
-        }
-        .stButton > button, .stDownloadButton > button {
-            border-radius: 10px;
-            font-weight: 650;
-            transition: transform .15s ease, box-shadow .15s ease;
-        }
-        .stButton > button:hover, .stDownloadButton > button:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 5px 14px rgba(37,49,58,.12);
-        }
-        .stButton > button[kind="primary"] {
-            background: linear-gradient(135deg, var(--tm-primary), var(--tm-accent));
-            border: none;
-        }
+        .block-container { max-width: 1500px; padding-top: 1.25rem; padding-bottom: 3rem; }
+        h1, h2, h3, h4, p, label, span { color: var(--tm-text); }
+        h1, h2, h3 { letter-spacing: -0.02em; }
+
         .tm-hero {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 1rem;
-            padding: 1.25rem 1.4rem;
-            background: linear-gradient(135deg, #FFFFFF 0%, #FAF0F2 100%);
-            border: 1px solid #EAD8DC;
-            border-radius: 20px;
-            box-shadow: 0 10px 34px rgba(80, 36, 44, .08);
-            margin-bottom: 1.1rem;
+            display:flex; align-items:center; justify-content:space-between; gap:1rem;
+            padding:1.25rem 1.4rem; margin-bottom:1.1rem; border-radius:20px;
+            color:var(--tm-text);
+            background:linear-gradient(135deg, var(--tm-surface), var(--tm-soft-primary));
+            border:1px solid var(--tm-border); box-shadow:var(--tm-shadow);
         }
-        .tm-hero h1 { margin: 0; font-size: 2rem; }
-        .tm-hero p { margin: .25rem 0 0; color: var(--tm-muted); }
+        .tm-hero h1 { margin:0; font-size:2rem; color:var(--tm-text) !important; }
+        .tm-hero p { margin:.25rem 0 0; color:var(--tm-muted) !important; }
         .tm-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: .4rem;
-            padding: .42rem .75rem;
-            border-radius: 999px;
-            background: #FFFFFF;
-            border: 1px solid #E8D4D8;
-            color: var(--tm-primary-dark);
-            font-size: .85rem;
-            font-weight: 700;
-            white-space: nowrap;
+            display:inline-flex; align-items:center; gap:.4rem; padding:.42rem .75rem;
+            border-radius:999px; background:var(--tm-bg); border:1px solid var(--tm-border);
+            color:var(--tm-text) !important; font-size:.85rem; font-weight:700; white-space:nowrap;
         }
-        .tm-section {
-            background: var(--tm-surface);
-            border: 1px solid var(--tm-border);
-            border-radius: 18px;
-            padding: 1rem 1.15rem;
-            box-shadow: 0 8px 28px rgba(32,43,53,.05);
-            margin-bottom: 1rem;
+        .tm-section, div[data-testid="stMetric"], div[data-testid="stForm"] {
+            background:var(--tm-surface); border:1px solid var(--tm-border);
+            border-radius:18px; box-shadow:var(--tm-shadow);
         }
-        .tm-status {
-            border-radius: 14px;
-            padding: .85rem 1rem;
-            font-weight: 650;
-            border: 1px solid transparent;
+        .tm-section { padding:1rem 1.15rem; margin-bottom:1rem; }
+        div[data-testid="stMetric"] { padding:1rem 1.15rem; }
+        div[data-testid="stForm"] { padding:1rem; }
+        div[data-testid="stMetric"] label { color:var(--tm-muted) !important; }
+        div[data-testid="stMetricValue"] { color:var(--tm-text) !important; }
+        div[data-testid="stExpander"] {
+            border:1px solid var(--tm-border); border-radius:14px; background:var(--tm-surface);
         }
-        .tm-ok { background:#EDF8F3; color:#176843; border-color:#C9E9DA; }
-        .tm-warn { background:#FFF7E8; color:#93590D; border-color:#F1D9A9; }
-        .tm-bad { background:#FFF0EE; color:#9D2A20; border-color:#F0C5BF; }
-        .tm-muted-card { background:#F7F9FA; color:#5F6B73; border-color:#E3E8EB; }
-        .tm-mini-title { color: var(--tm-muted); font-size: .82rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
-        .tm-mini-value { color: var(--tm-text); font-size: 1.12rem; font-weight: 750; margin-top: .2rem; }
+
+        .tm-status { border-radius:14px; padding:.85rem 1rem; font-weight:650; border:1px solid transparent; }
+        .tm-ok { background:color-mix(in srgb, var(--tm-success) 16%, var(--tm-surface)); color:color-mix(in srgb, var(--tm-success) 82%, var(--tm-text)) !important; border-color:color-mix(in srgb, var(--tm-success) 40%, transparent); }
+        .tm-warn { background:color-mix(in srgb, var(--tm-warning) 16%, var(--tm-surface)); color:color-mix(in srgb, var(--tm-warning) 82%, var(--tm-text)) !important; border-color:color-mix(in srgb, var(--tm-warning) 40%, transparent); }
+        .tm-bad { background:color-mix(in srgb, var(--tm-danger) 16%, var(--tm-surface)); color:color-mix(in srgb, var(--tm-danger) 82%, var(--tm-text)) !important; border-color:color-mix(in srgb, var(--tm-danger) 40%, transparent); }
+        .tm-muted-card { background:var(--tm-surface); color:var(--tm-muted) !important; border-color:var(--tm-border); }
+        .tm-mini-title { color:var(--tm-muted) !important; font-size:.82rem; font-weight:700; text-transform:uppercase; letter-spacing:.06em; }
+        .tm-mini-value { color:var(--tm-text) !important; font-size:1.12rem; font-weight:750; margin-top:.2rem; }
 
         .tm-kpi-card {
-            display: flex;
-            align-items: center;
-            gap: .85rem;
-            background: var(--tm-surface);
-            border: 1px solid var(--tm-border);
-            border-left: 5px solid var(--tm-muted);
-            border-radius: 16px;
-            padding: .95rem 1.1rem;
-            box-shadow: 0 7px 22px rgba(32,43,53,.06);
-            transition: transform .15s ease, box-shadow .15s ease;
+            display:flex; align-items:center; gap:.85rem; background:var(--tm-surface);
+            border:1px solid var(--tm-border); border-left:5px solid var(--tm-muted);
+            border-radius:16px; padding:.95rem 1.1rem; box-shadow:var(--tm-shadow);
+            transition:transform .15s ease, box-shadow .15s ease;
         }
-        .tm-kpi-card:hover { transform: translateY(-2px); box-shadow: 0 10px 26px rgba(32,43,53,.09); }
-        .tm-kpi-icon {
-            font-size: 1.6rem;
-            width: 46px; height: 46px;
-            display: flex; align-items: center; justify-content: center;
-            border-radius: 12px;
-            flex-shrink: 0;
-        }
-        .tm-kpi-text { line-height: 1.15; }
-        .tm-kpi-value { font-size: 1.55rem; font-weight: 800; color: var(--tm-text); }
-        .tm-kpi-label { font-size: .8rem; color: var(--tm-muted); font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
+        .tm-kpi-card:hover { transform:translateY(-2px); }
+        .tm-kpi-icon { font-size:1.6rem; width:46px; height:46px; display:flex; align-items:center; justify-content:center; border-radius:12px; flex-shrink:0; background:var(--tm-soft-primary); }
+        .tm-kpi-text { line-height:1.15; }
+        .tm-kpi-value { font-size:1.55rem; font-weight:800; color:var(--tm-text) !important; }
+        .tm-kpi-label { font-size:.8rem; color:var(--tm-muted) !important; font-weight:650; text-transform:uppercase; letter-spacing:.04em; }
+        .tm-kpi-neutral { border-left-color:var(--tm-primary); }
+        .tm-kpi-ok { border-left-color:var(--tm-success); }
+        .tm-kpi-ok .tm-kpi-icon { background:color-mix(in srgb, var(--tm-success) 16%, var(--tm-surface)); }
+        .tm-kpi-warn { border-left-color:var(--tm-warning); }
+        .tm-kpi-warn .tm-kpi-icon { background:color-mix(in srgb, var(--tm-warning) 16%, var(--tm-surface)); }
+        .tm-kpi-bad { border-left-color:var(--tm-danger); }
+        .tm-kpi-bad .tm-kpi-icon { background:color-mix(in srgb, var(--tm-danger) 16%, var(--tm-surface)); }
 
-        .tm-kpi-neutral { border-left-color: var(--tm-primary); }
-        .tm-kpi-neutral .tm-kpi-icon { background: var(--tm-soft); }
-        .tm-kpi-ok { border-left-color: var(--tm-success); }
-        .tm-kpi-ok .tm-kpi-icon { background: #EDF8F3; }
-        .tm-kpi-warn { border-left-color: var(--tm-warning); }
-        .tm-kpi-warn .tm-kpi-icon { background: #FFF7E8; }
-        .tm-kpi-bad { border-left-color: var(--tm-danger); }
-        .tm-kpi-bad .tm-kpi-icon { background: #FFF0EE; }
-        .tm-kpi-value, .tm-kpi-label { color: var(--tm-text) !important; opacity: 1 !important; }
-        .tm-kpi-label { color: var(--tm-muted) !important; }
-        div[data-baseweb="tab-list"] { gap: .4rem; }
-        button[data-baseweb="tab"] {
-            border-radius: 10px;
-            padding: .65rem 1rem;
-            color: var(--tm-muted) !important;
-        }
-        button[data-baseweb="tab"][aria-selected="true"] {
-            color: var(--tm-primary) !important;
-            font-weight: 750 !important;
-        }
+        div[data-baseweb="tab-list"] { gap:.4rem; }
+        button[data-baseweb="tab"] { border-radius:10px; padding:.65rem 1rem; color:var(--tm-muted) !important; }
+        button[data-baseweb="tab"][aria-selected="true"] { color:var(--tm-primary) !important; font-weight:750 !important; }
 
-        /* Corrección de contraste frente a temas oscuros del navegador/Streamlit */
-        html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
-            color-scheme: light !important;
+        .stButton > button, .stDownloadButton > button {
+            border-radius:10px; font-weight:650; color:var(--tm-text);
+            background:var(--tm-surface); border:1px solid var(--tm-border);
+            transition:transform .15s ease, box-shadow .15s ease;
         }
-        [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] * {
-            --text-color: var(--tm-text);
-        }
-        .stApp, .stApp p, .stApp span, .stApp label,
-        .stApp div[data-testid="stMarkdownContainer"],
-        .stApp div[data-testid="stMarkdownContainer"] p,
-        .stApp div[data-testid="stMarkdownContainer"] li {
-            color: var(--tm-text);
-        }
-        .tm-hero h1, .tm-hero p, .tm-badge,
-        .tm-section, .tm-section *, .tm-status, .tm-status * {
-            opacity: 1 !important;
-        }
-        .tm-hero h1 { color: var(--tm-primary-dark) !important; }
-        .tm-hero p { color: var(--tm-muted) !important; }
-        .tm-badge { color: var(--tm-primary-dark) !important; }
-        .tm-ok { color:#176843 !important; }
-        .tm-warn { color:#93590D !important; }
-        .tm-bad { color:#9D2A20 !important; }
-        .tm-muted-card { color:#5F6B73 !important; }
+        .stButton > button:hover, .stDownloadButton > button:hover { transform:translateY(-1px); box-shadow:var(--tm-shadow); }
+        .stButton > button[kind="primary"] { color:#FFF !important; background:linear-gradient(135deg, #8F1D2C, #C94A5B); border:none; }
 
-        [data-testid="stSidebar"] *,
-        [data-testid="stSidebar"] label,
-        [data-testid="stSidebar"] p,
-        [data-testid="stSidebar"] span,
-        [data-testid="stSidebar"] h1,
-        [data-testid="stSidebar"] h2,
-        [data-testid="stSidebar"] h3 {
-            color: var(--tm-text) !important;
-            opacity: 1 !important;
+        div[data-baseweb="select"] > div, input, textarea {
+            color:var(--tm-text) !important; background:var(--tm-bg) !important; border-color:var(--tm-border) !important;
         }
-        [data-testid="stSidebar"] div[data-baseweb="select"] > div,
-        [data-testid="stSidebar"] input,
-        [data-testid="stSidebar"] textarea {
-            background: #FFFFFF !important;
-            color: var(--tm-text) !important;
-            border-color: var(--tm-border) !important;
-        }
-        [data-testid="stSidebar"] .stButton > button,
-        [data-testid="stSidebar"] .stDownloadButton > button {
-            color: var(--tm-text) !important;
-            background: #FFFFFF !important;
-            border: 1px solid var(--tm-border) !important;
-        }
-        [data-testid="stSidebar"] .stButton > button[kind="primary"] {
-            color: #FFFFFF !important;
-            background: linear-gradient(135deg, var(--tm-primary), var(--tm-accent)) !important;
-            border: none !important;
-        }
-        [data-testid="stSidebar"] button:disabled,
-        [data-testid="stSidebar"] input:disabled {
-            color: #76838B !important;
-            background: #F3F5F6 !important;
-            opacity: 1 !important;
-        }
-        div[data-testid="stMetric"] *,
-        div[data-testid="stMetric"] label,
-        div[data-testid="stMetricValue"] {
-            color: var(--tm-text) !important;
-            opacity: 1 !important;
-        }
-        div[data-testid="stMetric"] label { color: var(--tm-muted) !important; }
-        div[data-testid="stMetricDelta"] * { color: var(--tm-success) !important; }
-        [data-testid="stWidgetLabel"] p { color: var(--tm-text) !important; }
-        div[data-baseweb="select"] > div,
-        input, textarea {
-            color: var(--tm-text) !important;
-            background-color: #FFFFFF !important;
+        input::placeholder, textarea::placeholder { color:var(--tm-muted) !important; opacity:.85; }
+        [data-testid="stWidgetLabel"] p, [data-testid="stSidebar"] p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] span { color:var(--tm-text) !important; }
+        [data-testid="stSidebar"] button:disabled, [data-testid="stSidebar"] input:disabled { opacity:.55 !important; }
+
+        /* Tablas y mensajes también respetan el tema */
+        [data-testid="stDataFrame"], [data-testid="stTable"] { border-radius:14px; overflow:hidden; border:1px solid var(--tm-border); }
+        [data-testid="stAlert"] { color:var(--tm-text); border-color:var(--tm-border); }
+
+        @media (max-width: 900px) {
+            .tm-hero { align-items:flex-start; flex-direction:column; }
+            .tm-badge { white-space:normal; }
         }
         </style>
         """,
@@ -1310,11 +1197,11 @@ with col_gauge:
         fig_gauge = go.Figure(go.Indicator(
             mode="gauge+number",
             value=conformidad,
-            number={"suffix": "%", "font": {"size": 34, "color": "#24313A"}},
+            number={"suffix": "%", "font": {"size": 34}},
             gauge={
-                "axis": {"range": [0, 100], "tickcolor": "#97A3AA", "tickfont": {"color": "#697780"}},
+                "axis": {"range": [0, 100]},
                 "bar": {"color": color_gauge, "thickness": 0.28},
-                "bgcolor": "white",
+                "bgcolor": "rgba(0,0,0,0)",
                 "borderwidth": 0,
                 "steps": [
                     {"range": [0, 80], "color": "#FFF0EE"},
@@ -1324,7 +1211,7 @@ with col_gauge:
             },
         ))
         fig_gauge.update_layout(
-            height=190, margin=dict(l=15, r=15, t=15, b=5),
+            template="streamlit", height=190, margin=dict(l=15, r=15, t=15, b=5),
             paper_bgcolor="rgba(0,0,0,0)",
             font=dict(family="Arial, sans-serif"),
         )
@@ -1389,11 +1276,10 @@ with tab_panel:
         ))
         fig.update_layout(
             height=540, margin=dict(l=20, r=20, t=25, b=20),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#FFFFFF",
-            font=dict(color="#24313A", family="Arial, sans-serif"),
-            xaxis=dict(title="Fecha", showgrid=False, rangeslider=dict(visible=True, thickness=0.06), tickfont=dict(color="#52616B"), title_font=dict(color="#24313A")),
-            yaxis=dict(title=f"Valor ({unidad})", gridcolor="#E8EDF0", tickfont=dict(color="#52616B"), title_font=dict(color="#24313A")),
-            hoverlabel=dict(bgcolor="#FFFFFF", font_color="#24313A", bordercolor="#DDE3E7"),
+            template="streamlit", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family="Arial, sans-serif"),
+            xaxis=dict(title="Fecha", showgrid=False, rangeslider=dict(visible=True, thickness=0.06)),
+            yaxis=dict(title=f"Valor ({unidad})", gridcolor="rgba(128,128,128,0.22)"),
             hovermode="x unified", showlegend=False,
         )
         st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
@@ -1409,10 +1295,9 @@ with tab_panel:
             ))
             fig_estado.update_layout(
                 height=300, margin=dict(l=10,r=10,t=10,b=10),
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#FFFFFF",
-                font=dict(color="#24313A", family="Arial, sans-serif"),
-                xaxis=dict(tickfont=dict(color="#52616B")),
-                yaxis=dict(title="Cantidad", tickfont=dict(color="#52616B"), title_font=dict(color="#24313A"), gridcolor="#E8EDF0"),
+                template="streamlit", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(family="Arial, sans-serif"),
+                yaxis=dict(title="Cantidad", gridcolor="rgba(128,128,128,0.22)"),
             )
             st.plotly_chart(fig_estado, use_container_width=True, config={"displayModeBar": False})
         with c2:
