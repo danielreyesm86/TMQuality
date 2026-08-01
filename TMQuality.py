@@ -57,7 +57,7 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.3"
 PBKDF2_ITERATIONS = 260_000
 LEGACY_PBKDF2_ITERATIONS = 100_000
 ROLES = ["Administrador", "Supervisor", "Operador"]
@@ -77,63 +77,108 @@ st.set_page_config(
 st.markdown(
     """
 <style>
+/* TMQuality 3.0.3 — CSS verdaderamente adaptativo a los temas de Streamlit 1.60+ */
 :root {
-    --tmq-primary: var(--primary-color, #a61b2b);
-    --tmq-bg: var(--background-color, #ffffff);
-    --tmq-surface: var(--secondary-background-color, #f6f7f9);
-    --tmq-text: var(--text-color, #17212b);
-    --tmq-border: color-mix(in srgb, var(--tmq-text) 14%, transparent);
-    --tmq-muted: color-mix(in srgb, var(--tmq-text) 65%, transparent);
-    --tmq-shadow: 0 10px 30px rgba(0,0,0,.08);
+    --tmq-primary: var(--st-primary-color, #c51f3a);
+    --tmq-radius: 16px;
+    --tmq-shadow: 0 8px 24px rgba(0,0,0,.10);
 }
 
-[data-testid="stAppViewContainer"] {
-    background: var(--tmq-bg);
-    color: var(--tmq-text);
+/* No fijamos colores claros: heredamos el tema activo de Streamlit */
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+[data-testid="stMainBlockContainer"] {
+    background-color: var(--st-background-color, transparent) !important;
+    color: var(--st-text-color, inherit) !important;
 }
-[data-testid="stSidebar"] {
-    background: var(--tmq-surface);
-    border-right: 1px solid var(--tmq-border);
+
+[data-testid="stSidebar"],
+[data-testid="stSidebarContent"] {
+    background-color: var(--st-secondary-background-color, transparent) !important;
+    color: var(--st-text-color, inherit) !important;
 }
+[data-testid="stSidebar"] * { color: inherit; }
 
 .tmq-hero {
     padding: 1.15rem 1.3rem;
-    border: 1px solid var(--tmq-border);
+    border: 1px solid var(--st-border-color, rgba(128,128,128,.28));
     border-radius: 18px;
-    background: linear-gradient(135deg,
-        color-mix(in srgb, var(--tmq-primary) 11%, var(--tmq-bg)),
-        var(--tmq-bg));
+    background: var(--st-secondary-background-color, transparent);
+    color: var(--st-text-color, inherit);
     box-shadow: var(--tmq-shadow);
     margin-bottom: 1rem;
 }
-.tmq-hero h1 { margin:0; font-size:2rem; letter-spacing:-.03em; }
-.tmq-hero p { margin:.35rem 0 0 0; color:var(--tmq-muted); }
+.tmq-hero h1 { margin:0; font-size:2rem; letter-spacing:-.03em; color:var(--st-text-color, inherit); }
+.tmq-hero p { margin:.35rem 0 0 0; color:color-mix(in srgb, var(--st-text-color, #808080) 68%, transparent); }
 .tmq-badge {
     display:inline-flex; align-items:center; gap:.35rem;
     padding:.28rem .62rem; border-radius:999px;
-    border:1px solid var(--tmq-border); font-size:.78rem; font-weight:700;
+    border:1px solid var(--st-border-color, rgba(128,128,128,.28));
+    background:var(--st-secondary-background-color, transparent);
+    color:var(--st-text-color, inherit);
+    font-size:.78rem; font-weight:700;
 }
 .tmq-kpi {
-    border: 1px solid var(--tmq-border);
-    border-radius: 16px;
+    border: 1px solid var(--st-border-color, rgba(128,128,128,.28));
+    border-radius: var(--tmq-radius);
     padding: .95rem 1rem;
-    background: var(--tmq-bg);
-    box-shadow: 0 6px 20px rgba(0,0,0,.05);
+    background: var(--st-secondary-background-color, transparent);
+    color: var(--st-text-color, inherit);
+    box-shadow: var(--tmq-shadow);
     min-height: 106px;
 }
-.tmq-kpi .label { color:var(--tmq-muted); font-size:.8rem; font-weight:700; text-transform:uppercase; letter-spacing:.05em; }
-.tmq-kpi .value { font-size:1.75rem; font-weight:800; margin-top:.2rem; }
-.tmq-kpi .hint { color:var(--tmq-muted); font-size:.78rem; margin-top:.25rem; }
+.tmq-kpi .label { color:color-mix(in srgb, var(--st-text-color, #808080) 72%, transparent); font-size:.8rem; font-weight:700; text-transform:uppercase; letter-spacing:.05em; }
+.tmq-kpi .value { color:var(--st-text-color, inherit); font-size:1.75rem; font-weight:800; margin-top:.2rem; }
+.tmq-kpi .hint { color:color-mix(in srgb, var(--st-text-color, #808080) 64%, transparent); font-size:.78rem; margin-top:.25rem; }
 .tmq-card {
-    border:1px solid var(--tmq-border); border-radius:16px; padding:1rem;
-    background:var(--tmq-bg); box-shadow:0 6px 20px rgba(0,0,0,.04);
+    border:1px solid var(--st-border-color, rgba(128,128,128,.28));
+    border-radius:var(--tmq-radius); padding:1rem;
+    background:var(--st-secondary-background-color, transparent);
+    color:var(--st-text-color, inherit);
+    box-shadow:var(--tmq-shadow);
 }
-.tmq-section-title { margin:.25rem 0 .8rem 0; font-weight:800; font-size:1.15rem; }
-.tmq-muted { color:var(--tmq-muted); }
-div[data-testid="stMetric"] { border:1px solid var(--tmq-border); border-radius:14px; padding:.7rem; }
-button[kind="primary"], div.stButton > button[kind="primary"] { font-weight:700; }
+.tmq-section-title { margin:.25rem 0 .8rem 0; font-weight:800; font-size:1.15rem; color:var(--st-text-color, inherit); }
+.tmq-muted { color:color-mix(in srgb, var(--st-text-color, #808080) 65%, transparent); }
+
+/* Widgets: dejar que Streamlit gestione el tema, pero asegurar contraste */
+[data-baseweb="select"] > div,
+[data-baseweb="input"] > div,
+[data-baseweb="textarea"] > div,
+[data-testid="stTextInputRootElement"],
+[data-testid="stNumberInputContainer"] {
+    background-color: var(--st-secondary-background-color, transparent) !important;
+    color: var(--st-text-color, inherit) !important;
+    border-color: var(--st-border-color, rgba(128,128,128,.28)) !important;
+}
+
 [data-baseweb="tab-list"] { gap:.35rem; }
-[data-baseweb="tab"] { border-radius:10px 10px 0 0; }
+[data-baseweb="tab"] { border-radius:10px 10px 0 0; color:var(--st-text-color, inherit) !important; }
+[data-baseweb="tab"][aria-selected="true"] { color:var(--tmq-primary) !important; }
+
+div[data-testid="stMetric"] {
+    border:1px solid var(--st-border-color, rgba(128,128,128,.28));
+    border-radius:14px; padding:.7rem;
+    background:var(--st-secondary-background-color, transparent);
+}
+button[kind="primary"], div.stButton > button[kind="primary"] { font-weight:700; }
+
+/* Dataframes, expanders y formularios */
+[data-testid="stExpander"],
+[data-testid="stForm"] {
+    border-color: var(--st-border-color, rgba(128,128,128,.28)) !important;
+    background: var(--st-background-color, transparent);
+}
+
+/* Evita franjas blancas por elementos que exceden el ancho en dark */
+html, body, #root { background:var(--st-background-color, #0e1117); }
+[data-testid="stAppViewContainer"] { overflow-x:hidden; }
+
+/* Plotly container debe integrarse con el fondo activo */
+[data-testid="stPlotlyChart"] {
+    background:var(--st-background-color, transparent) !important;
+    border-radius:14px;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -654,21 +699,46 @@ def list_audit(conn, limit=1000):
 # GRÁFICOS Y PDF
 # -----------------------------------------------------------------------------
 def levey_jennings_figure(df: pd.DataFrame, mean: float, sd: float, unit: str):
+    """Levey–Jennings legible tanto en Light como en Dark."""
+    try:
+        theme_type = st.context.theme.type
+    except Exception:
+        theme_type = "light"
+
+    dark = theme_type == "dark"
+    text_color = "#f3f4f6" if dark else "#17212b"
+    grid_color = "rgba(255,255,255,0.14)" if dark else "rgba(23,33,43,0.12)"
+    rule_color = "rgba(229,231,235,0.78)" if dark else "rgba(17,24,39,0.78)"
+    mean_color = "#f8fafc" if dark else "#111827"
+    plot_bg = "#0e1117" if dark else "#ffffff"
+
     fig = go.Figure()
     if not df.empty:
         x = pd.to_datetime(df["fecha"]).dt.strftime("%d-%m-%Y")
         fig.add_trace(go.Scatter(
             x=x, y=df["valor"], mode="lines+markers", name="Resultado",
+            line=dict(width=2.4), marker=dict(size=7),
             hovertemplate="%{x}<br>%{y:.4f} " + unit + "<extra></extra>",
         ))
+
     levels = [(0, "Media", "solid"), (1, "+1 DE", "dot"), (-1, "-1 DE", "dot"),
               (2, "+2 DE", "dash"), (-2, "-2 DE", "dash"), (3, "+3 DE", "solid"), (-3, "-3 DE", "solid")]
     for mult, label, dash in levels:
-        fig.add_hline(y=mean + mult * sd, line_dash=dash, annotation_text=label, annotation_position="right")
+        color = mean_color if mult == 0 else rule_color
+        width = 2.2 if mult == 0 else 1.5
+        fig.add_hline(
+            y=mean + mult * sd, line_dash=dash, line_color=color, line_width=width,
+            annotation_text=label, annotation_position="right",
+            annotation_font_color=text_color,
+        )
+
     fig.update_layout(
-        height=470, margin=dict(l=20,r=20,t=30,b=20),
+        height=470, margin=dict(l=20,r=52,t=30,b=20),
         xaxis_title="Fecha", yaxis_title=unit,
         hovermode="x unified", legend_orientation="h",
+        paper_bgcolor=plot_bg, plot_bgcolor=plot_bg, font=dict(color=text_color),
+        xaxis=dict(gridcolor=grid_color, zerolinecolor=grid_color, tickfont=dict(color=text_color), title_font=dict(color=text_color)),
+        yaxis=dict(gridcolor=grid_color, zerolinecolor=grid_color, tickfont=dict(color=text_color), title_font=dict(color=text_color)),
     )
     return fig
 
