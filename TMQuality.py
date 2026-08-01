@@ -59,6 +59,7 @@ from reportlab.platypus import (
 
 APP_VERSION = "3.0.0"
 PBKDF2_ITERATIONS = 260_000
+LEGACY_PBKDF2_ITERATIONS = 100_000
 ROLES = ["Administrador", "Supervisor", "Operador"]
 ESTADOS = ["Aceptado", "Advertencia", "Rechazado", "Pendiente"]
 TURNOS = ["Mañana", "Tarde", "Noche", "Otro"]
@@ -385,9 +386,14 @@ def init_db(conn):
 # -----------------------------------------------------------------------------
 # SEGURIDAD / USUARIOS
 # -----------------------------------------------------------------------------
-def hash_password(password: str, salt_hex: Optional[str] = None) -> tuple[str, str]:
+def hash_password(password: str, salt_hex: Optional[str] = None, iterations: int = PBKDF2_ITERATIONS) -> tuple[str, str]:
+    """Genera PBKDF2-SHA256.
+
+    ``iterations`` permite validar cuentas creadas por versiones anteriores de
+    TMQuality y migrarlas automáticamente al esquema actual.
+    """
     salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(32)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
     return digest.hex(), salt.hex()
 
 
@@ -432,13 +438,36 @@ def authenticate(conn, username: str, password: str) -> tuple[Optional[dict], st
     if row.get("bloqueado_hasta") and row["bloqueado_hasta"] > datetime.now():
         return None, f"Cuenta temporalmente bloqueada hasta {row['bloqueado_hasta']:%H:%M}."
 
-    candidate, _ = hash_password(password, row["salt"])
-    if not hmac.compare_digest(candidate, row["password_hash"]):
+    # Primero valida con el esquema actual (260.000 iteraciones).
+    candidate, _ = hash_password(password, row["salt"], PBKDF2_ITERATIONS)
+    password_valid = hmac.compare_digest(candidate, row["password_hash"])
+    migrated_legacy_hash = False
+
+    # Compatibilidad con usuarios creados por TMQuality 1.x / 2.x, que usaban
+    # PBKDF2-SHA256 con 100.000 iteraciones. Si la contraseña coincide, se
+    # re-hashea inmediatamente con el esquema nuevo sin que el usuario tenga
+    # que cambiarla ni que un administrador intervenga.
+    if not password_valid:
+        legacy_candidate, _ = hash_password(password, row["salt"], LEGACY_PBKDF2_ITERATIONS)
+        password_valid = hmac.compare_digest(legacy_candidate, row["password_hash"])
+        migrated_legacy_hash = password_valid
+
+    if not password_valid:
         intentos = int(row.get("intentos_fallidos") or 0) + 1
         bloqueado = datetime.now() + timedelta(minutes=15) if intentos >= 5 else None
         execute(conn, "UPDATE usuarios SET intentos_fallidos=%s, bloqueado_hasta=%s WHERE id=%s", (intentos, bloqueado, row["id"]))
         audit(conn, "LOGIN_FALLIDO", "usuarios", row["id"], f"Contraseña incorrecta. Intento {intentos}", False, row)
         return None, "Credenciales inválidas." if not bloqueado else "Cuenta bloqueada 15 minutos por intentos fallidos."
+
+    if migrated_legacy_hash:
+        new_hash, new_salt = hash_password(password)
+        execute(
+            conn,
+            "UPDATE usuarios SET password_hash=%s, salt=%s WHERE id=%s",
+            (new_hash, new_salt, row["id"]),
+        )
+        audit(conn, "HASH_PASSWORD_ACTUALIZADO", "usuarios", row["id"],
+              "Hash de contraseña migrado automáticamente al esquema PBKDF2 actual", True, row)
 
     execute(conn, "UPDATE usuarios SET intentos_fallidos=0, bloqueado_hasta=NULL, ultimo_acceso=CURRENT_TIMESTAMP WHERE id=%s", (row["id"],))
     row = fetchone(conn, "SELECT * FROM usuarios WHERE id=%s", (row["id"],))
