@@ -192,6 +192,182 @@ hr{border-color:var(--tmq-border)!important;}
 .stApp form span {color:var(--tmq-text)!important;}
 .stAlert [data-testid="stMarkdownContainer"] p{color:inherit!important;}
 
+
+/* --------------------------------------------------------------------------
+   TMQuality 4.0.3 — normalización visual completa de widgets Streamlit
+   -------------------------------------------------------------------------- */
+
+/* Selectbox / multiselect: siempre superficie blanca y texto oscuro */
+div[data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+div[data-testid="stMultiSelect"] div[data-baseweb="select"] > div,
+div[data-baseweb="select"] > div {
+    background:#FFFFFF !important;
+    border:1px solid var(--tmq-border) !important;
+    color:var(--tmq-text) !important;
+    box-shadow:none !important;
+}
+div[data-testid="stSelectbox"] div[data-baseweb="select"] *,
+div[data-testid="stMultiSelect"] div[data-baseweb="select"] *,
+div[data-baseweb="select"] * {
+    color:var(--tmq-text) !important;
+    -webkit-text-fill-color:var(--tmq-text) !important;
+}
+div[data-baseweb="select"] svg {
+    color:#66738A !important;
+    fill:#66738A !important;
+}
+
+/* Menús desplegables */
+ul[role="listbox"],
+div[role="listbox"],
+[data-baseweb="popover"],
+[data-baseweb="menu"] {
+    background:#FFFFFF !important;
+    color:var(--tmq-text) !important;
+}
+li[role="option"],
+div[role="option"] {
+    background:#FFFFFF !important;
+    color:var(--tmq-text) !important;
+}
+li[role="option"]:hover,
+div[role="option"]:hover,
+li[role="option"][aria-selected="true"],
+div[role="option"][aria-selected="true"] {
+    background:var(--tmq-blue-soft) !important;
+    color:var(--tmq-blue) !important;
+}
+
+/* Inputs, text areas, date/time inputs */
+div[data-testid="stTextInputRootElement"],
+div[data-testid="stNumberInputContainer"],
+div[data-baseweb="input"],
+div[data-baseweb="textarea"],
+div[data-testid="stDateInput"] > div > div,
+div[data-testid="stTimeInput"] > div > div {
+    background:#FFFFFF !important;
+    color:var(--tmq-text) !important;
+    border-color:var(--tmq-border) !important;
+}
+input, textarea {
+    color:var(--tmq-text) !important;
+    -webkit-text-fill-color:var(--tmq-text) !important;
+}
+input:disabled, textarea:disabled {
+    color:#8792A6 !important;
+    -webkit-text-fill-color:#8792A6 !important;
+    opacity:1 !important;
+}
+
+/* Botones secundarios */
+div.stButton > button,
+div.stDownloadButton > button {
+    background:#FFFFFF !important;
+    color:var(--tmq-navy) !important;
+    border:1px solid #D7DEE9 !important;
+    box-shadow:0 1px 2px rgba(20,33,61,.03) !important;
+}
+div.stButton > button p,
+div.stButton > button span,
+div.stDownloadButton > button p,
+div.stDownloadButton > button span {
+    color:inherit !important;
+}
+div.stButton > button:hover:not(:disabled),
+div.stDownloadButton > button:hover:not(:disabled) {
+    background:#F5F8FD !important;
+    color:var(--tmq-blue) !important;
+    border-color:#B8CAE6 !important;
+    box-shadow:0 4px 12px rgba(31,111,235,.08) !important;
+}
+
+/* Botón principal */
+button[kind="primary"],
+div.stButton > button[kind="primary"] {
+    background:var(--tmq-blue) !important;
+    color:#FFFFFF !important;
+    border-color:var(--tmq-blue) !important;
+}
+button[kind="primary"] p,
+button[kind="primary"] span {
+    color:#FFFFFF !important;
+}
+
+/* Deshabilitados: gris claro, nunca negro */
+button:disabled,
+div.stButton > button:disabled,
+div.stDownloadButton > button:disabled,
+button[disabled] {
+    background:#F1F4F8 !important;
+    color:#8A95A8 !important;
+    border-color:#E0E5EC !important;
+    box-shadow:none !important;
+    opacity:1 !important;
+    cursor:not-allowed !important;
+}
+button:disabled p,
+button:disabled span,
+div.stButton > button:disabled p,
+div.stButton > button:disabled span {
+    color:#8A95A8 !important;
+    -webkit-text-fill-color:#8A95A8 !important;
+    opacity:1 !important;
+}
+
+/* Formularios y expanders */
+[data-testid="stForm"],
+[data-testid="stExpander"] {
+    background:#FFFFFF !important;
+    color:var(--tmq-text) !important;
+}
+
+/* Pestañas */
+button[data-baseweb="tab"] {
+    background:transparent !important;
+    color:var(--tmq-muted) !important;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+    color:var(--tmq-blue) !important;
+    font-weight:800 !important;
+}
+
+/* Dataframes / data editor. Mantener contenedor claro; el canvas interno de
+   Streamlit conserva su propio contraste, pero no hereda negro del CSS global. */
+[data-testid="stDataFrame"],
+[data-testid="stDataEditor"] {
+    background:#FFFFFF !important;
+    color:var(--tmq-text) !important;
+    border:1px solid var(--tmq-border) !important;
+    border-radius:16px !important;
+}
+[data-testid="stDataFrame"] > div,
+[data-testid="stDataEditor"] > div {
+    background:#FFFFFF !important;
+}
+
+/* Radio, checkbox, toggle */
+[data-testid="stRadio"] label,
+[data-testid="stCheckbox"] label,
+[data-testid="stToggle"] label {
+    color:var(--tmq-text) !important;
+}
+
+/* Focus visible */
+input:focus,
+textarea:focus,
+div[data-baseweb="select"] > div:focus-within {
+    border-color:var(--tmq-blue) !important;
+    box-shadow:0 0 0 3px rgba(31,111,235,.12) !important;
+}
+
+/* Sidebar: evitar que controles hereden fondo oscuro */
+[data-testid="stSidebar"] div[data-baseweb="select"] > div,
+[data-testid="stSidebar"] div[data-baseweb="input"],
+[data-testid="stSidebar"] div[data-baseweb="textarea"] {
+    background:#FFFFFF !important;
+    color:var(--tmq-text) !important;
+}
+
 /* TMQuality 4.0.1 usa deliberadamente un único tema claro coherente. */
 </style>
 """,
