@@ -1,1819 +1,1121 @@
 """
-Sistema de Control de Calidad - Laboratorio (Medicina Transfusional)
-======================================================================
-Módulo de Control de Calidad con reglas de Westgard y gráficos
-de Levey-Jennings.
+TMQuality 3.0
+Sistema de gestión de Control de Calidad Analítico para laboratorio.
 
-Cómo correr:
-    pip install streamlit plotly pandas matplotlib reportlab psycopg2-binary
-    streamlit run app.py
+Arquitectura
+------------
+- Streamlit (interfaz)
+- PostgreSQL / Supabase (persistencia)
+- psycopg2 (conexión)
+- Plotly (visualización)
+- ReportLab (informes PDF)
 
-La base de datos PostgreSQL se almacena de forma permanente en Supabase.
-La URI se configura mediante Streamlit Secrets: [database].url.
+Seguridad
+---------
+- No existen credenciales administrativas predeterminadas.
+- Si no hay administradores activos, el alta inicial requiere un token de
+  bootstrap guardado en Streamlit Secrets:
+
+    [database]
+    url = "postgresql://..."
+
+    [security]
+    bootstrap_token = "TOKEN_LARGO_Y_ALEATORIO"
+
+Una vez creado el primer administrador, el token deja de ser necesario para
+el uso normal de la aplicación.
 """
 
+from __future__ import annotations
+
+import hashlib
+import hmac
 import os
-import psycopg2
-import uuid
-from psycopg2 import IntegrityError
-from datetime import datetime, date
+import secrets
+from datetime import date, datetime, timedelta
 from io import BytesIO
+from typing import Any, Iterable, Optional
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import plotly.graph_objects as go
+import psycopg2
+from psycopg2 import IntegrityError
+from psycopg2.extras import RealDictCursor
 import streamlit as st
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import (
-    Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
 )
 
+APP_VERSION = "3.0.0"
+PBKDF2_ITERATIONS = 260_000
+ROLES = ["Administrador", "Supervisor", "Operador"]
+ESTADOS = ["Aceptado", "Advertencia", "Rechazado", "Pendiente"]
+TURNOS = ["Mañana", "Tarde", "Noche", "Otro"]
 
-# ----------------------------------------------------------------------
-# LOGO (incrustado en base64 para que el archivo sea autocontenido)
-# ----------------------------------------------------------------------
-LOGO_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAAABmJLR0QA/wD/AP+gvaeTAAAgAElEQVR4nOzdd3gd1Z0+8PfM3HvV"
-    "q4sk997kgi33KmNbtoxtMGAINfSS5BeS0JPsQsJCyEISSCgBsgkLbAotSzUGt2BswL032cbGvcnq5ZY5vz+MWWNcpDvlzJ15P88z"
-    "zz5raWbeiHtnvnPOnHMAIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi"
-    "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi"
-    "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIrLIrtLS6btKS6erzkFEagjVAYjIedtKSlqH"
-    "AoG1ADQjFhvQac6c/aozEZGzNNUBiMhZEhBJgcCfAeQBaKXp+ouSDwNEvsMCgMhndk+d+iMDuEAC+Gor+XLq1B+qzkVEzmLVT+Qj"
-    "uyZPLoSuLwOQcsqPGmOaNqzLu++uUZGLiJzHFgAin/iiuDhZavpfIZGCkx7/v9qS9Jjx192zZp1aGBCRR7EAIPIJPSXtMQH0P8uv"
-    "9DFqax91LBARKcUuACIf2D116hRDyvdx7u+8hBAzOr7//rtO5CIidVgAEHnctpKS1kFdXwegdRN3ORgC+hXMnn3YzlxEpBa7AIg8"
-    "Lqjrz6DpN38AyAtL+YJdeYjIHVgAEHnYrtLSmwFc0uwdhbhwZ2npDdYnIiK3YBcAkUftLCnpDF1fAyAjzkPU6oZxXvs5c7ZZmYuI"
-    "3IEtAEQeJB98UBO6/iLiv/kDQFpM016Us2bpFsUiIhdhAUDkQbs+//x+CYy14FCjvqypucuC4xCRy7ALgMhjdpaWDgTwGYCQRYcM"
-    "G4YxtMucOZwlkMhD2AJA5CFlpaVJUuK/IRE6zWx/8W4hTWicJZDIY1gAEHlIyMCjAuhnw6H7xGpqHrLhuESkCLsAiDxi15QpEyTE"
-    "h7CvsDcgtYmd5ry3wKbjE5GDWAAQecD2iROztEBwHYD2Np9qV1Sgf/fZs6tsPg8R2YxdAEQeoAVCT8D+mz8AdNSl+K0D5yEim7EF"
-    "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"
+# -----------------------------------------------------------------------------
+# CONFIGURACIÓN Y ESTILO
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="TMQuality 3.0",
+    page_icon="🩸",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
+st.markdown(
+    """
+<style>
+:root {
+    --tmq-primary: var(--primary-color, #a61b2b);
+    --tmq-bg: var(--background-color, #ffffff);
+    --tmq-surface: var(--secondary-background-color, #f6f7f9);
+    --tmq-text: var(--text-color, #17212b);
+    --tmq-border: color-mix(in srgb, var(--tmq-text) 14%, transparent);
+    --tmq-muted: color-mix(in srgb, var(--tmq-text) 65%, transparent);
+    --tmq-shadow: 0 10px 30px rgba(0,0,0,.08);
+}
 
-# ----------------------------------------------------------------------
-# ACCESO CON CONTRASEÑA
-# ----------------------------------------------------------------------
-# La contraseña se lee desde Streamlit secrets (archivo .streamlit/secrets.toml
-# en local, o la sección "Secrets" del panel de Streamlit Cloud al desplegar).
-# Si no encuentra ningún secreto configurado, usa este valor por defecto
-# SOLO para pruebas locales rápidas — cámbialo o, mejor, configura el secreto.
-def obtener_logo():
-    """Decodifica el logo embebido y lo devuelve como imagen PIL,
-    lista para usar en st.image o como page_icon."""
-    import base64
-    from PIL import Image
-    return Image.open(BytesIO(base64.b64decode(LOGO_B64)))
+[data-testid="stAppViewContainer"] {
+    background: var(--tmq-bg);
+    color: var(--tmq-text);
+}
+[data-testid="stSidebar"] {
+    background: var(--tmq-surface);
+    border-right: 1px solid var(--tmq-border);
+}
 
+.tmq-hero {
+    padding: 1.15rem 1.3rem;
+    border: 1px solid var(--tmq-border);
+    border-radius: 18px;
+    background: linear-gradient(135deg,
+        color-mix(in srgb, var(--tmq-primary) 11%, var(--tmq-bg)),
+        var(--tmq-bg));
+    box-shadow: var(--tmq-shadow);
+    margin-bottom: 1rem;
+}
+.tmq-hero h1 { margin:0; font-size:2rem; letter-spacing:-.03em; }
+.tmq-hero p { margin:.35rem 0 0 0; color:var(--tmq-muted); }
+.tmq-badge {
+    display:inline-flex; align-items:center; gap:.35rem;
+    padding:.28rem .62rem; border-radius:999px;
+    border:1px solid var(--tmq-border); font-size:.78rem; font-weight:700;
+}
+.tmq-kpi {
+    border: 1px solid var(--tmq-border);
+    border-radius: 16px;
+    padding: .95rem 1rem;
+    background: var(--tmq-bg);
+    box-shadow: 0 6px 20px rgba(0,0,0,.05);
+    min-height: 106px;
+}
+.tmq-kpi .label { color:var(--tmq-muted); font-size:.8rem; font-weight:700; text-transform:uppercase; letter-spacing:.05em; }
+.tmq-kpi .value { font-size:1.75rem; font-weight:800; margin-top:.2rem; }
+.tmq-kpi .hint { color:var(--tmq-muted); font-size:.78rem; margin-top:.25rem; }
+.tmq-card {
+    border:1px solid var(--tmq-border); border-radius:16px; padding:1rem;
+    background:var(--tmq-bg); box-shadow:0 6px 20px rgba(0,0,0,.04);
+}
+.tmq-section-title { margin:.25rem 0 .8rem 0; font-weight:800; font-size:1.15rem; }
+.tmq-muted { color:var(--tmq-muted); }
+div[data-testid="stMetric"] { border:1px solid var(--tmq-border); border-radius:14px; padding:.7rem; }
+button[kind="primary"], div.stButton > button[kind="primary"] { font-weight:700; }
+[data-baseweb="tab-list"] { gap:.35rem; }
+[data-baseweb="tab"] { border-radius:10px 10px 0 0; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-def verificar_acceso():
-    """Muestra una pantalla de acceso con usuario + contraseña, con la
-    marca TMQuality. Si las credenciales son correctas, guarda los
-    datos del usuario en la sesión y deja continuar; si no, detiene
-    la ejecución del resto de la app."""
-    if st.session_state.get("usuario_actual"):
-        return
-
-    st.markdown(
-        """
-        <style>
-        [data-testid="stAppViewContainer"] {
-            background: linear-gradient(180deg, var(--background-color) 0%, var(--secondary-background-color) 100%);
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    col_izq, col_centro, col_der = st.columns([1, 1.3, 1])
-    with col_centro:
-        st.markdown("<div style='height: 4vh'></div>", unsafe_allow_html=True)
-        st.image(obtener_logo(), width=120)
-        st.markdown(
-            """
-            <h1 style='text-align:center; color:#A81F2E; margin-bottom:0;
-                       font-size:2.6rem;'>TMQuality</h1>
-            <p style='text-align:center; color:#5A6A72; margin-top:0.2rem;
-                      font-size:1.05rem;'>
-                Control de Calidad · Laboratorio Clínico y Medicina Transfusional
-            </p>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown("<div style='height: 2vh'></div>", unsafe_allow_html=True)
-
-        def _intentar_login():
-            usuario_input = st.session_state.get("username_login", "").strip()
-            clave = st.session_state.get("clave_login", "")
-            conn_login = get_connection()
-            usuario = autenticar_usuario(conn_login, usuario_input, clave)
-            conn_login.close()
-            if usuario:
-                st.session_state["usuario_actual"] = usuario
-                st.session_state["login_error"] = False
-            else:
-                st.session_state["login_error"] = True
-
-        st.text_input(
-            "Usuario", key="username_login",
-            placeholder="Usuario", label_visibility="collapsed",
-        )
-        # Usamos on_change (no st.form) para que presionar Enter dentro
-        # del campo de contraseña dispare el login de inmediato, sin
-        # necesidad de hacer clic aparte en el botón.
-        st.text_input(
-            "Contraseña", type="password",
-            key="clave_login", on_change=_intentar_login,
-            placeholder="Contraseña", label_visibility="collapsed",
-        )
-        st.button("Ingresar →", use_container_width=True, on_click=_intentar_login)
-
-        if st.session_state.get("login_error"):
-            st.error("Usuario o contraseña incorrectos. Inténtalo de nuevo.")
-
-        st.markdown(
-            """
-            <p style='text-align:center; color:#9AA5AA; font-size:0.8rem;
-                      margin-top:1.5rem;'>
-                Acceso restringido · Sistema interno de calidad
-            </p>
-            """,
-            unsafe_allow_html=True,
-        )
-    st.stop()
-
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # BASE DE DATOS
-# ----------------------------------------------------------------------
-
-def _postgres_url():
-    """Obtiene la URI PostgreSQL desde Streamlit Secrets o DATABASE_URL."""
+# -----------------------------------------------------------------------------
+def get_database_url() -> str:
     try:
         return st.secrets["database"]["url"]
     except Exception:
-        url = os.getenv("DATABASE_URL")
-        if url:
-            return url
-    raise RuntimeError(
-        "No se encontró la conexión PostgreSQL. Configure [database].url "
-        "en los Secrets de Streamlit."
-    )
-
-
-def _pg_sql(sql):
-    """Convierte marcadores SQLite (?) a marcadores psycopg2 (%s)."""
-    return sql.replace("?", "%s")
-
-
-class PostgresCursor:
-    """Adaptador pequeño para conservar la interfaz usada por la aplicación."""
-    def __init__(self, cursor):
-        self._cursor = cursor
-
-    def execute(self, sql, params=None):
-        self._cursor.execute(_pg_sql(sql), params or ())
-        return self
-
-    def executemany(self, sql, seq_of_params):
-        self._cursor.executemany(_pg_sql(sql), seq_of_params)
-        return self
-
-    def fetchone(self):
-        return self._cursor.fetchone()
-
-    def fetchall(self):
-        return self._cursor.fetchall()
-
-    @property
-    def rowcount(self):
-        return self._cursor.rowcount
-
-    def close(self):
-        self._cursor.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
-
-
-class PostgresConnection:
-    """Conexión compatible con los usos históricos de conn.execute()."""
-    def __init__(self, raw):
-        self.raw = raw
-
-    def cursor(self):
-        return PostgresCursor(self.raw.cursor())
-
-    def execute(self, sql, params=None):
-        cur = self.cursor()
-        return cur.execute(sql, params)
-
-    def executemany(self, sql, seq_of_params):
-        cur = self.cursor()
-        return cur.executemany(sql, seq_of_params)
-
-    def commit(self):
-        self.raw.commit()
-
-    def rollback(self):
-        self.raw.rollback()
-
-    def close(self):
-        self.raw.close()
+        env_url = os.getenv("DATABASE_URL")
+        if env_url:
+            return env_url
+        st.error("No se encontró la conexión PostgreSQL. Configura [database].url en Streamlit Secrets.")
+        st.stop()
 
 
 def get_connection():
     try:
-        raw = psycopg2.connect(
-            _postgres_url(),
-            connect_timeout=12,
-            application_name="TMQuality",
-            sslmode="require",
-        )
-        raw.autocommit = False
-        return PostgresConnection(raw)
+        return psycopg2.connect(get_database_url(), connect_timeout=12)
     except Exception as exc:
         st.error("No fue posible conectar TMQuality con Supabase.")
         st.code(str(exc))
         st.stop()
 
 
-def read_sql(query, conn, params=None):
-    """Ejecuta consultas de pandas con sintaxis PostgreSQL."""
-    return pd.read_sql_query(_pg_sql(query), conn.raw, params=params)
-
-
-def init_db():
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS analitos (
-                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                    nombre TEXT NOT NULL UNIQUE,
-                    unidad TEXT NOT NULL
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS lotes_control (
-                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                    analito_id BIGINT NOT NULL REFERENCES analitos(id) ON DELETE CASCADE,
-                    nivel TEXT NOT NULL CHECK (nivel IN ('Bajo','Normal','Alto')),
-                    lote TEXT NOT NULL,
-                    media_objetivo DOUBLE PRECISION NOT NULL,
-                    de_objetivo DOUBLE PRECISION NOT NULL,
-                    vigente BOOLEAN NOT NULL DEFAULT TRUE,
-                    UNIQUE (analito_id, nivel, lote)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS resultados_cc (
-                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                    lote_control_id BIGINT NOT NULL REFERENCES lotes_control(id) ON DELETE CASCADE,
-                    fecha DATE NOT NULL,
-                    turno TEXT NOT NULL,
-                    operador TEXT NOT NULL,
-                    valor DOUBLE PRECISION NOT NULL,
-                    reglas_violadas TEXT,
-                    estado TEXT NOT NULL DEFAULT 'Pendiente',
-                    accion_correctiva TEXT
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS usuarios (
-                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                    nombre_completo TEXT NOT NULL,
-                    username TEXT NOT NULL UNIQUE,
-                    password_hash TEXT NOT NULL,
-                    salt TEXT NOT NULL,
-                    rol TEXT NOT NULL,
-                    activo BOOLEAN NOT NULL DEFAULT TRUE,
-                    fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    debe_cambiar_password BOOLEAN NOT NULL DEFAULT FALSE,
-                    ultimo_acceso TIMESTAMP,
-                    fecha_ultimo_cambio_password TIMESTAMP,
-                    intentos_fallidos INTEGER NOT NULL DEFAULT 0,
-                    creado_por BIGINT REFERENCES usuarios(id) ON DELETE SET NULL
-                )
-            """)
-            cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS debe_cambiar_password BOOLEAN NOT NULL DEFAULT FALSE")
-            cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ultimo_acceso TIMESTAMP")
-            cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fecha_ultimo_cambio_password TIMESTAMP")
-            cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS intentos_fallidos INTEGER NOT NULL DEFAULT 0")
-            cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS creado_por BIGINT REFERENCES usuarios(id) ON DELETE SET NULL")
-            cur.execute("ALTER TABLE usuarios DROP CONSTRAINT IF EXISTS usuarios_rol_check")
-            cur.execute("ALTER TABLE usuarios ADD CONSTRAINT usuarios_rol_check CHECK (rol IN ('Administrador','Supervisor','Operador'))")
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS auditoria (
-                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                    fecha_hora TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    usuario_id BIGINT REFERENCES usuarios(id) ON DELETE SET NULL,
-                    username TEXT,
-                    rol TEXT,
-                    accion TEXT NOT NULL,
-                    entidad TEXT NOT NULL,
-                    entidad_id TEXT,
-                    detalle TEXT,
-                    exito BOOLEAN NOT NULL DEFAULT TRUE,
-                    sesion_id TEXT
-                )
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_auditoria_fecha ON auditoria (fecha_hora DESC)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_auditoria_usuario ON auditoria (usuario_id)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_lotes_analito ON lotes_control (analito_id)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_resultados_lote_fecha ON resultados_cc (lote_control_id, fecha)")
-        conn.commit()
-
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM analitos")
-            sin_analitos = cur.fetchone()[0] == 0
-        if sin_analitos:
-            try:
-                seed_demo_data(conn)
-            except IntegrityError:
-                conn.rollback()
-
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM usuarios")
-            sin_usuarios = cur.fetchone()[0] == 0
-        if sin_usuarios:
-            # Sin credenciales genéricas. Solo se habilita un bootstrap explícito si la base queda vacía.
-            try:
-                clave_inicial = st.secrets["bootstrap_admin_password"]
-            except Exception:
-                clave_inicial = None
-            if clave_inicial:
-                try:
-                    crear_usuario(conn, "Administrador inicial", "admin_bootstrap", clave_inicial,
-                                 "Administrador", creado_por=None)
-                except (IntegrityError, ValueError):
-                    conn.rollback()
-    finally:
-        conn.close()
-
-
-def seed_demo_data(conn):
-    """Carga un lote demostrativo únicamente cuando la base está vacía."""
+def execute(conn, sql: str, params: Optional[Iterable[Any]] = None, *, commit: bool = True):
     with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO analitos (nombre, unidad) VALUES (%s, %s) RETURNING id",
-            ("Hemoglobina", "g/dL"),
-        )
-        analito_id = cur.fetchone()[0]
-
-        cur.execute("""
-            INSERT INTO lotes_control
-                (analito_id, nivel, lote, media_objetivo, de_objetivo)
-            VALUES (%s, 'Normal', 'LOTE-2026-01', 12.0, 0.3)
-            RETURNING id
-        """, (analito_id,))
-        lote_id = cur.fetchone()[0]
-
-        demo_valores = [12.1, 11.9, 12.2, 12.0, 11.8, 12.3, 12.0, 12.05,
-                        12.9, 11.95, 12.1]
-        base_date = date(2026, 7, 1)
-        filas = [
-            (lote_id, base_date.replace(day=1 + i), "Largo", "Demo", valor, "Pendiente")
-            for i, valor in enumerate(demo_valores)
-        ]
-        cur.executemany("""
-            INSERT INTO resultados_cc
-                (lote_control_id, fecha, turno, operador, valor, estado)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, filas)
-    conn.commit()
-
-
-# ----------------------------------------------------------------------
-# USUARIOS (autenticación con hash + salt)
-# ----------------------------------------------------------------------
-
-def _hash_password(password, salt_hex=None):
-    """Genera hash PBKDF2-SHA256 de la contraseña. Si no se pasa salt,
-    genera uno nuevo (para crear usuario); si se pasa, lo reutiliza
-    (para verificar login)."""
-    import hashlib
-    import secrets as secrets_module
-
-    if salt_hex is None:
-        salt_hex = secrets_module.token_hex(16)
-
-    salt_bytes = bytes.fromhex(salt_hex)
-    hash_bytes = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt_bytes, 100_000
-    )
-    return hash_bytes.hex(), salt_hex
-
-
-def validar_password(password):
-    errores = []
-    if len(password) < 10:
-        errores.append("mínimo 10 caracteres")
-    if not any(c.isupper() for c in password):
-        errores.append("al menos una mayúscula")
-    if not any(c.islower() for c in password):
-        errores.append("al menos una minúscula")
-    if not any(c.isdigit() for c in password):
-        errores.append("al menos un número")
-    return errores
-
-
-def _usuario_sesion():
-    return st.session_state.get("usuario_actual") or {}
-
-
-def _session_id():
-    if "session_id" not in st.session_state:
-        st.session_state["session_id"] = str(uuid.uuid4())
-    return st.session_state["session_id"]
-
-
-def registrar_auditoria(conn, accion, entidad, entidad_id=None, detalle=None,
-                        usuario=None, exito=True, username=None, commit=True):
-    """Registra trazabilidad sin almacenar contraseñas ni secretos."""
-    usuario = usuario or _usuario_sesion()
-    uid = usuario.get("id") if usuario else None
-    uname = username or (usuario.get("username") if usuario else None)
-    rol = usuario.get("rol") if usuario else None
-    conn.execute("""
-        INSERT INTO auditoria
-            (usuario_id, username, rol, accion, entidad, entidad_id, detalle, exito, sesion_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (uid, uname, rol, accion, entidad,
-          str(entidad_id) if entidad_id is not None else None,
-          detalle, bool(exito), _session_id()))
+        cur.execute(sql, tuple(params or ()))
     if commit:
         conn.commit()
 
 
-def crear_usuario(conn, nombre_completo, username, password, rol, creado_por=None):
-    errores = validar_password(password)
-    if errores:
-        raise ValueError("La contraseña requiere: " + ", ".join(errores) + ".")
-    if rol not in ("Administrador", "Supervisor", "Operador"):
-        raise ValueError("Rol no válido.")
-    hash_hex, salt_hex = _hash_password(password)
-    cur = conn.execute("""
-        INSERT INTO usuarios
-            (nombre_completo, username, password_hash, salt, rol, activo,
-             fecha_creacion, debe_cambiar_password, fecha_ultimo_cambio_password, creado_por)
-        VALUES (?, ?, ?, ?, ?, TRUE, ?, TRUE, ?, ?)
-        RETURNING id
-    """, (nombre_completo.strip(), username.strip().lower(), hash_hex, salt_hex, rol,
-          datetime.now(), datetime.now(), creado_por))
-    nuevo_id = cur.fetchone()[0]
-    registrar_auditoria(conn, "CREAR_USUARIO", "usuarios", nuevo_id,
-                        f"Cuenta creada: @{username.strip().lower()} · rol {rol}", commit=False)
-    conn.commit()
-    return nuevo_id
+def fetchone(conn, sql: str, params: Optional[Iterable[Any]] = None) -> Optional[dict]:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, tuple(params or ()))
+        row = cur.fetchone()
+    return dict(row) if row else None
 
 
-def autenticar_usuario(conn, username, password):
-    username = (username or "").strip().lower()
-    fila = conn.execute("""
-        SELECT id, nombre_completo, username, password_hash, salt, rol, activo,
-               debe_cambiar_password, intentos_fallidos
-        FROM usuarios WHERE lower(username) = ?
-    """, (username,)).fetchone()
-    if fila is None:
-        registrar_auditoria(conn, "LOGIN_FALLIDO", "sesion", detalle="Usuario inexistente",
-                            exito=False, username=username)
-        return None
-    (user_id, nombre_completo, uname, hash_guardado, salt, rol, activo,
-     debe_cambiar_password, intentos_fallidos) = fila
-    if not activo:
-        registrar_auditoria(conn, "LOGIN_FALLIDO", "sesion", user_id,
-                            "Cuenta inactiva", exito=False, username=uname)
-        return None
-    hash_calculado, _ = _hash_password(password, salt)
-    if hash_calculado != hash_guardado:
-        conn.execute("UPDATE usuarios SET intentos_fallidos = intentos_fallidos + 1 WHERE id = ?", (user_id,))
-        registrar_auditoria(conn, "LOGIN_FALLIDO", "sesion", user_id,
-                            "Contraseña incorrecta", exito=False, username=uname, commit=False)
-        conn.commit()
-        return None
-    conn.execute("UPDATE usuarios SET ultimo_acceso = CURRENT_TIMESTAMP, intentos_fallidos = 0 WHERE id = ?", (user_id,))
-    usuario = {"id": user_id, "nombre_completo": nombre_completo,
-               "username": uname, "rol": rol,
-               "debe_cambiar_password": bool(debe_cambiar_password)}
-    registrar_auditoria(conn, "LOGIN_OK", "sesion", user_id, "Inicio de sesión correcto",
-                        usuario=usuario, commit=False)
-    conn.commit()
-    return usuario
+def fetchall_df(conn, sql: str, params: Optional[Iterable[Any]] = None) -> pd.DataFrame:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, tuple(params or ()))
+        rows = cur.fetchall()
+    return pd.DataFrame([dict(r) for r in rows])
 
 
-def listar_usuarios(conn):
-    return read_sql("""
-        SELECT id, nombre_completo, username, rol, activo, fecha_creacion,
-               ultimo_acceso, debe_cambiar_password, intentos_fallidos
-        FROM usuarios ORDER BY nombre_completo ASC
-    """, conn)
+def init_db(conn):
+    """Crea/migra el esquema sin borrar datos existentes."""
+    ddl = [
+        """
+        CREATE TABLE IF NOT EXISTS analitos (
+            id BIGSERIAL PRIMARY KEY,
+            nombre TEXT NOT NULL UNIQUE,
+            unidad TEXT NOT NULL,
+            metodologia TEXT,
+            error_total_permitido DOUBLE PRECISION,
+            activo BOOLEAN NOT NULL DEFAULT TRUE,
+            fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS equipos (
+            id BIGSERIAL PRIMARY KEY,
+            nombre TEXT NOT NULL,
+            fabricante TEXT,
+            modelo TEXT,
+            numero_serie TEXT UNIQUE,
+            area TEXT,
+            ubicacion TEXT,
+            activo BOOLEAN NOT NULL DEFAULT TRUE,
+            fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS lotes_control (
+            id BIGSERIAL PRIMARY KEY,
+            analito_id BIGINT NOT NULL REFERENCES analitos(id) ON DELETE CASCADE,
+            nivel TEXT NOT NULL,
+            lote TEXT NOT NULL,
+            fabricante TEXT,
+            material_control TEXT,
+            fecha_vencimiento DATE,
+            media_objetivo DOUBLE PRECISION NOT NULL,
+            de_objetivo DOUBLE PRECISION NOT NULL,
+            vigente BOOLEAN NOT NULL DEFAULT TRUE,
+            fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (analito_id, nivel, lote)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id BIGSERIAL PRIMARY KEY,
+            nombre_completo TEXT NOT NULL,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            rol TEXT NOT NULL,
+            activo BOOLEAN NOT NULL DEFAULT TRUE,
+            cambio_password_requerido BOOLEAN NOT NULL DEFAULT TRUE,
+            intentos_fallidos INTEGER NOT NULL DEFAULT 0,
+            bloqueado_hasta TIMESTAMP,
+            ultimo_acceso TIMESTAMP,
+            fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            fecha_modificacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS resultados_cc (
+            id BIGSERIAL PRIMARY KEY,
+            lote_control_id BIGINT NOT NULL REFERENCES lotes_control(id) ON DELETE CASCADE,
+            equipo_id BIGINT REFERENCES equipos(id) ON DELETE SET NULL,
+            usuario_id BIGINT REFERENCES usuarios(id) ON DELETE SET NULL,
+            fecha DATE NOT NULL,
+            hora TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            turno TEXT NOT NULL,
+            operador TEXT NOT NULL,
+            valor DOUBLE PRECISION NOT NULL,
+            z_score DOUBLE PRECISION,
+            reglas_violadas TEXT,
+            estado TEXT NOT NULL DEFAULT 'Pendiente',
+            accion_correctiva TEXT,
+            comentarios TEXT,
+            revisado_por BIGINT REFERENCES usuarios(id) ON DELETE SET NULL,
+            fecha_revision TIMESTAMP,
+            fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            fecha_modificacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS auditoria (
+            id BIGSERIAL PRIMARY KEY,
+            fecha_hora TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            usuario_id BIGINT REFERENCES usuarios(id) ON DELETE SET NULL,
+            username TEXT,
+            rol TEXT,
+            accion TEXT NOT NULL,
+            entidad TEXT,
+            entidad_id TEXT,
+            detalle TEXT,
+            exito BOOLEAN NOT NULL DEFAULT TRUE
+        )
+        """,
+    ]
+    for sql in ddl:
+        execute(conn, sql)
 
-
-def cambiar_password(conn, user_id, nueva_password, forzado=False):
-    errores = validar_password(nueva_password)
-    if errores:
-        raise ValueError("La contraseña requiere: " + ", ".join(errores) + ".")
-    hash_hex, salt_hex = _hash_password(nueva_password)
-    conn.execute("""
-        UPDATE usuarios
-        SET password_hash = ?, salt = ?, debe_cambiar_password = FALSE,
-            fecha_ultimo_cambio_password = CURRENT_TIMESTAMP
-        WHERE id = ?
-    """, (hash_hex, salt_hex, user_id))
-    registrar_auditoria(conn, "CAMBIAR_PASSWORD", "usuarios", user_id,
-                        "Cambio obligatorio completado" if forzado else "Contraseña actualizada", commit=False)
-    conn.commit()
-    if st.session_state.get("usuario_actual", {}).get("id") == user_id:
-        st.session_state["usuario_actual"]["debe_cambiar_password"] = False
-
-
-def contar_administradores_activos(conn):
-    return conn.execute("SELECT COUNT(*) FROM usuarios WHERE rol = 'Administrador' AND activo = TRUE").fetchone()[0]
-
-
-def set_usuario_activo(conn, user_id, activo: bool):
-    fila = conn.execute("SELECT username, rol, activo FROM usuarios WHERE id = ?", (user_id,)).fetchone()
-    if not fila:
-        raise ValueError("Usuario no encontrado.")
-    username, rol, estado_actual = fila
-    if not activo and rol == "Administrador" and estado_actual and contar_administradores_activos(conn) <= 1:
-        raise ValueError("No se puede desactivar al último administrador activo.")
-    conn.execute("UPDATE usuarios SET activo = ? WHERE id = ?", (bool(activo), user_id))
-    registrar_auditoria(conn, "REACTIVAR_USUARIO" if activo else "DESACTIVAR_USUARIO",
-                        "usuarios", user_id, f"@{username}", commit=False)
-    conn.commit()
-
-
-def cambiar_rol_usuario(conn, user_id, nuevo_rol):
-    if nuevo_rol not in ("Administrador", "Supervisor", "Operador"):
-        raise ValueError("Rol no válido.")
-    fila = conn.execute("SELECT username, rol, activo FROM usuarios WHERE id = ?", (user_id,)).fetchone()
-    if not fila:
-        raise ValueError("Usuario no encontrado.")
-    username, rol_anterior, activo = fila
-    if rol_anterior == "Administrador" and nuevo_rol != "Administrador" and activo and contar_administradores_activos(conn) <= 1:
-        raise ValueError("No se puede cambiar el rol del último administrador activo.")
-    conn.execute("UPDATE usuarios SET rol = ? WHERE id = ?", (nuevo_rol, user_id))
-    registrar_auditoria(conn, "CAMBIAR_ROL", "usuarios", user_id,
-                        f"@{username}: {rol_anterior} → {nuevo_rol}", commit=False)
-    conn.commit()
-
-
-def resetear_password_usuario(conn, user_id, password_temporal):
-    errores = validar_password(password_temporal)
-    if errores:
-        raise ValueError("La contraseña temporal requiere: " + ", ".join(errores) + ".")
-    hash_hex, salt_hex = _hash_password(password_temporal)
-    conn.execute("""
-        UPDATE usuarios SET password_hash = ?, salt = ?, debe_cambiar_password = TRUE,
-            fecha_ultimo_cambio_password = CURRENT_TIMESTAMP
-        WHERE id = ?
-    """, (hash_hex, salt_hex, user_id))
-    registrar_auditoria(conn, "RESET_PASSWORD", "usuarios", user_id,
-                        "Administrador asignó contraseña temporal; cambio obligatorio", commit=False)
-    conn.commit()
-
-
-def cargar_auditoria(conn, limite=500):
-    return read_sql("""
-        SELECT fecha_hora, username, rol, accion, entidad, entidad_id, detalle, exito
-        FROM auditoria ORDER BY fecha_hora DESC LIMIT ?
-    """, conn, params=(int(limite),))
-
-# ----------------------------------------------------------------------
-# Cada función recibe la serie completa de z-scores (valor - media) / DE,
-# en orden cronológico, y evalúa si el ÚLTIMO punto dispara la regla.
-
-def z_scores(valores, media, de):
-    return [(v - media) / de for v in valores]
-
-
-def regla_1_2s(z):
-    """Advertencia: 1 punto fuera de ±2DE. No rechaza por sí sola."""
-    return abs(z[-1]) > 2
-
-
-def regla_1_3s(z):
-    """Rechazo: 1 punto fuera de ±3DE. Error aleatorio grave."""
-    return abs(z[-1]) > 3
-
-
-def regla_2_2s(z):
-    """Rechazo: 2 puntos consecutivos fuera de ±2DE, mismo lado."""
-    if len(z) < 2:
-        return False
-    a, b = z[-2], z[-1]
-    return (a > 2 and b > 2) or (a < -2 and b < -2)
-
-
-def regla_r_4s(z):
-    """Rechazo: diferencia entre 2 puntos consecutivos > 4DE (lados opuestos)."""
-    if len(z) < 2:
-        return False
-    return abs(z[-1] - z[-2]) > 4
-
-
-def regla_4_1s(z):
-    """Rechazo: 4 puntos consecutivos fuera de ±1DE, mismo lado. Error sistemático."""
-    if len(z) < 4:
-        return False
-    ultimos = z[-4:]
-    return all(v > 1 for v in ultimos) or all(v < -1 for v in ultimos)
-
-
-def regla_10x(z):
-    """Rechazo: 10 puntos consecutivos al mismo lado de la media. Error sistemático."""
-    if len(z) < 10:
-        return False
-    ultimos = z[-10:]
-    return all(v > 0 for v in ultimos) or all(v < 0 for v in ultimos)
-
-
-REGLAS = {
-    "1_2s (advertencia)": (regla_1_2s, "advertencia"),
-    "1_3s": (regla_1_3s, "rechazo"),
-    "2_2s": (regla_2_2s, "rechazo"),
-    "R_4s": (regla_r_4s, "rechazo"),
-    "4_1s": (regla_4_1s, "rechazo"),
-    "10x": (regla_10x, "rechazo"),
-}
-
-
-def evaluar_westgard(valores, media, de):
-    """Devuelve lista de nombres de reglas violadas por el último punto."""
-    z = z_scores(valores, media, de)
-    violadas = []
-    for nombre, (fn, tipo) in REGLAS.items():
+    migrations = [
+        "ALTER TABLE analitos ADD COLUMN IF NOT EXISTS metodologia TEXT",
+        "ALTER TABLE analitos ADD COLUMN IF NOT EXISTS error_total_permitido DOUBLE PRECISION",
+        "ALTER TABLE analitos ADD COLUMN IF NOT EXISTS activo BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE analitos ADD COLUMN IF NOT EXISTS fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE lotes_control ADD COLUMN IF NOT EXISTS fabricante TEXT",
+        "ALTER TABLE lotes_control ADD COLUMN IF NOT EXISTS material_control TEXT",
+        "ALTER TABLE lotes_control ADD COLUMN IF NOT EXISTS fecha_vencimiento DATE",
+        "ALTER TABLE lotes_control ADD COLUMN IF NOT EXISTS fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cambio_password_requerido BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS intentos_fallidos INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS bloqueado_hasta TIMESTAMP",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ultimo_acceso TIMESTAMP",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fecha_modificacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS equipo_id BIGINT REFERENCES equipos(id) ON DELETE SET NULL",
+        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS usuario_id BIGINT REFERENCES usuarios(id) ON DELETE SET NULL",
+        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS hora TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS z_score DOUBLE PRECISION",
+        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS comentarios TEXT",
+        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS revisado_por BIGINT REFERENCES usuarios(id) ON DELETE SET NULL",
+        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS fecha_revision TIMESTAMP",
+        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS fecha_modificacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "CREATE INDEX IF NOT EXISTS idx_lotes_analito ON lotes_control(analito_id)",
+        "CREATE INDEX IF NOT EXISTS idx_resultados_lote_fecha ON resultados_cc(lote_control_id, fecha)",
+        "CREATE INDEX IF NOT EXISTS idx_resultados_equipo ON resultados_cc(equipo_id)",
+        "CREATE INDEX IF NOT EXISTS idx_auditoria_fecha ON auditoria(fecha_hora DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_auditoria_usuario ON auditoria(usuario_id)",
+    ]
+    for sql in migrations:
         try:
-            if fn(z):
-                violadas.append(nombre)
+            execute(conn, sql)
         except Exception:
-            pass
-    return violadas
+            conn.rollback()
+
+    # Ajustar constraint de roles si proviene de una versión anterior.
+    try:
+        execute(conn, "ALTER TABLE usuarios DROP CONSTRAINT IF EXISTS usuarios_rol_check")
+        execute(conn, "ALTER TABLE usuarios ADD CONSTRAINT usuarios_rol_check CHECK (rol IN ('Administrador','Supervisor','Operador'))")
+    except Exception:
+        conn.rollback()
+
+    # Tablas solo se usan por conexión servidor-servidor. No se exponen por PostgREST.
+    # Esto evita un falso sentido de seguridad por RLS sin políticas y reduce superficie pública.
+    for table in ["analitos", "equipos", "lotes_control", "resultados_cc", "usuarios", "auditoria"]:
+        for sql in [
+            f"ALTER TABLE public.{table} DISABLE ROW LEVEL SECURITY",
+            f"REVOKE ALL ON TABLE public.{table} FROM anon, authenticated",
+        ]:
+            try:
+                execute(conn, sql)
+            except Exception:
+                conn.rollback()
+
+# -----------------------------------------------------------------------------
+# SEGURIDAD / USUARIOS
+# -----------------------------------------------------------------------------
+def hash_password(password: str, salt_hex: Optional[str] = None) -> tuple[str, str]:
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(32)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return digest.hex(), salt.hex()
 
 
-def recalcular_reglas_lote(conn, lote_control_id, media, de):
-    """
-    Recorre todos los resultados del lote en orden cronológico y
-    recalcula reglas_violadas + estado desde cero. Útil después de
-    eliminar o corregir resultados, para que las series de Westgard
-    (que dependen de puntos anteriores) queden consistentes.
-    Devuelve la cantidad de filas actualizadas.
-    """
-    df = read_sql("""
-        SELECT id, valor FROM resultados_cc
-        WHERE lote_control_id = ?
-        ORDER BY fecha ASC, id ASC
-    """, conn, params=(lote_control_id,))
+def password_ok(password: str) -> tuple[bool, str]:
+    if len(password) < 10:
+        return False, "La contraseña debe tener al menos 10 caracteres."
+    if not any(c.isupper() for c in password):
+        return False, "Debe incluir al menos una mayúscula."
+    if not any(c.islower() for c in password):
+        return False, "Debe incluir al menos una minúscula."
+    if not any(c.isdigit() for c in password):
+        return False, "Debe incluir al menos un número."
+    return True, ""
 
-    valores_acumulados = []
-    actualizaciones = []
-    for _, row in df.iterrows():
-        valores_acumulados.append(row["valor"])
-        violadas = evaluar_westgard(valores_acumulados, media, de)
-        hay_rechazo = any(REGLAS[r][1] == "rechazo" for r in violadas)
-        estado = "Rechazado" if hay_rechazo else ("Advertencia" if violadas else "Aceptado")
-        actualizaciones.append((
-            ", ".join(violadas) if violadas else None,
-            estado,
-            int(row["id"]),
-        ))
 
-    conn.executemany(
-        "UPDATE resultados_cc SET reglas_violadas = ?, estado = ? WHERE id = ?",
-        actualizaciones
+def audit(conn, accion: str, entidad: Optional[str] = None, entidad_id: Optional[Any] = None,
+          detalle: Optional[str] = None, exito: bool = True, user: Optional[dict] = None):
+    user = user or st.session_state.get("user")
+    execute(
+        conn,
+        """
+        INSERT INTO auditoria (usuario_id, username, rol, accion, entidad, entidad_id, detalle, exito)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (
+            user.get("id") if user else None,
+            user.get("username") if user else None,
+            user.get("rol") if user else None,
+            accion, entidad, str(entidad_id) if entidad_id is not None else None, detalle, exito,
+        ),
     )
+
+
+def authenticate(conn, username: str, password: str) -> tuple[Optional[dict], str]:
+    row = fetchone(conn, "SELECT * FROM usuarios WHERE lower(username)=lower(%s)", (username.strip(),))
+    if not row:
+        audit(conn, "LOGIN_FALLIDO", "usuarios", None, f"Usuario inexistente: {username}", False, None)
+        return None, "Credenciales inválidas."
+    if not row["activo"]:
+        audit(conn, "LOGIN_FALLIDO", "usuarios", row["id"], "Cuenta inactiva", False, row)
+        return None, "La cuenta está desactivada."
+    if row.get("bloqueado_hasta") and row["bloqueado_hasta"] > datetime.now():
+        return None, f"Cuenta temporalmente bloqueada hasta {row['bloqueado_hasta']:%H:%M}."
+
+    candidate, _ = hash_password(password, row["salt"])
+    if not hmac.compare_digest(candidate, row["password_hash"]):
+        intentos = int(row.get("intentos_fallidos") or 0) + 1
+        bloqueado = datetime.now() + timedelta(minutes=15) if intentos >= 5 else None
+        execute(conn, "UPDATE usuarios SET intentos_fallidos=%s, bloqueado_hasta=%s WHERE id=%s", (intentos, bloqueado, row["id"]))
+        audit(conn, "LOGIN_FALLIDO", "usuarios", row["id"], f"Contraseña incorrecta. Intento {intentos}", False, row)
+        return None, "Credenciales inválidas." if not bloqueado else "Cuenta bloqueada 15 minutos por intentos fallidos."
+
+    execute(conn, "UPDATE usuarios SET intentos_fallidos=0, bloqueado_hasta=NULL, ultimo_acceso=CURRENT_TIMESTAMP WHERE id=%s", (row["id"],))
+    row = fetchone(conn, "SELECT * FROM usuarios WHERE id=%s", (row["id"],))
+    audit(conn, "LOGIN_EXITOSO", "usuarios", row["id"], "Inicio de sesión", True, row)
+    return row, ""
+
+
+def create_user(conn, nombre: str, username: str, password: str, rol: str, *, require_change: bool = True,
+                actor: Optional[dict] = None) -> int:
+    ok, msg = password_ok(password)
+    if not ok:
+        raise ValueError(msg)
+    ph, salt = hash_password(password)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO usuarios (nombre_completo, username, password_hash, salt, rol, activo, cambio_password_requerido)
+            VALUES (%s,%s,%s,%s,%s,TRUE,%s) RETURNING id
+            """,
+            (nombre.strip(), username.strip(), ph, salt, rol, require_change),
+        )
+        user_id = cur.fetchone()[0]
     conn.commit()
-    return len(actualizaciones)
+    audit(conn, "USUARIO_CREADO", "usuarios", user_id, f"Rol: {rol}", True, actor)
+    return user_id
 
 
-# ----------------------------------------------------------------------
-# CONSULTAS
-# ----------------------------------------------------------------------
+def change_password(conn, user_id: int, new_password: str, *, actor: Optional[dict] = None, require_change: bool = False):
+    ok, msg = password_ok(new_password)
+    if not ok:
+        raise ValueError(msg)
+    ph, salt = hash_password(new_password)
+    execute(conn,
+            "UPDATE usuarios SET password_hash=%s, salt=%s, cambio_password_requerido=%s, fecha_modificacion=CURRENT_TIMESTAMP WHERE id=%s",
+            (ph, salt, require_change, user_id))
+    audit(conn, "PASSWORD_CAMBIADA", "usuarios", user_id, "Contraseña actualizada", True, actor)
 
-def cargar_analitos(conn):
-    return read_sql("SELECT * FROM analitos ORDER BY nombre", conn)
+
+def active_admin_count(conn) -> int:
+    row = fetchone(conn, "SELECT COUNT(*) AS n FROM usuarios WHERE rol='Administrador' AND activo=TRUE")
+    return int(row["n"] if row else 0)
 
 
-def cargar_lotes(conn, analito_id):
-    return read_sql(
-        "SELECT * FROM lotes_control WHERE analito_id = ? AND vigente = TRUE",
-        conn, params=(analito_id,)
+def bootstrap_admin_ui(conn):
+    if active_admin_count(conn) > 0:
+        return
+    st.warning("No existe un Administrador activo. Se requiere configuración inicial segura.")
+    try:
+        token_expected = st.secrets["security"]["bootstrap_token"]
+    except Exception:
+        st.error("Configura [security].bootstrap_token en Streamlit Secrets para crear el primer administrador.")
+        st.stop()
+
+    with st.form("bootstrap_admin"):
+        st.subheader("Crear primer Administrador")
+        token = st.text_input("Token de configuración", type="password")
+        nombre = st.text_input("Nombre completo")
+        username = st.text_input("Usuario")
+        password = st.text_input("Contraseña", type="password")
+        password2 = st.text_input("Repetir contraseña", type="password")
+        submitted = st.form_submit_button("Crear Administrador", type="primary", use_container_width=True)
+    if submitted:
+        if not secrets.compare_digest(token, str(token_expected)):
+            st.error("Token de configuración incorrecto.")
+        elif password != password2:
+            st.error("Las contraseñas no coinciden.")
+        else:
+            try:
+                uid = create_user(conn, nombre, username, password, "Administrador", require_change=False, actor=None)
+                audit(conn, "BOOTSTRAP_ADMIN", "usuarios", uid, "Primer administrador creado mediante token de configuración", True, None)
+                st.success("Administrador creado. Ya puedes iniciar sesión.")
+                st.rerun()
+            except Exception as exc:
+                conn.rollback()
+                st.error(str(exc))
+        st.stop()
+
+# -----------------------------------------------------------------------------
+# REGLAS DE WESTGARD Y MÉTRICAS
+# -----------------------------------------------------------------------------
+def zscore(value: float, mean: float, sd: float) -> float:
+    return (value - mean) / sd if sd and sd > 0 else 0.0
+
+
+def westgard_rules(z_values: list[float]) -> list[str]:
+    """Evalúa reglas básicas sobre la secuencia cronológica de z-scores."""
+    if not z_values:
+        return []
+    rules: list[str] = []
+    z = z_values[-1]
+    if abs(z) >= 3:
+        rules.append("1_3s")
+    elif abs(z) >= 2:
+        rules.append("1_2s")
+    if len(z_values) >= 2:
+        a, b = z_values[-2], z_values[-1]
+        if abs(a) >= 2 and abs(b) >= 2 and (a > 0) == (b > 0):
+            rules.append("2_2s")
+        if abs(a - b) >= 4:
+            rules.append("R_4s")
+    if len(z_values) >= 4:
+        last4 = z_values[-4:]
+        if all(abs(x) >= 1 for x in last4) and (all(x > 0 for x in last4) or all(x < 0 for x in last4)):
+            rules.append("4_1s")
+    if len(z_values) >= 10:
+        last10 = z_values[-10:]
+        if all(x > 0 for x in last10) or all(x < 0 for x in last10):
+            rules.append("10x")
+    return rules
+
+
+def state_from_rules(rules: list[str]) -> str:
+    if any(r in rules for r in ["1_3s", "2_2s", "R_4s", "4_1s", "10x"]):
+        return "Rechazado"
+    if "1_2s" in rules:
+        return "Advertencia"
+    return "Aceptado"
+
+
+def qc_statistics(df: pd.DataFrame, target_mean: float, allowable_error: Optional[float]) -> dict:
+    if df.empty:
+        return {"n": 0, "mean": None, "sd": None, "cv": None, "bias": None, "sigma": None}
+    vals = pd.to_numeric(df["valor"], errors="coerce").dropna()
+    if vals.empty:
+        return {"n": 0, "mean": None, "sd": None, "cv": None, "bias": None, "sigma": None}
+    mean = float(vals.mean())
+    sd = float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
+    cv = (sd / mean * 100) if mean else None
+    bias = ((mean - target_mean) / target_mean * 100) if target_mean else None
+    sigma = ((allowable_error - abs(bias)) / cv) if allowable_error is not None and cv and cv > 0 and bias is not None else None
+    return {"n": len(vals), "mean": mean, "sd": sd, "cv": cv, "bias": bias, "sigma": sigma}
+
+# -----------------------------------------------------------------------------
+# DATOS / CONSULTAS
+# -----------------------------------------------------------------------------
+def load_analytes(conn, only_active=True):
+    sql = "SELECT * FROM analitos"
+    if only_active:
+        sql += " WHERE activo=TRUE"
+    sql += " ORDER BY nombre"
+    return fetchall_df(conn, sql)
+
+
+def load_equipment(conn, only_active=True):
+    sql = "SELECT * FROM equipos"
+    if only_active:
+        sql += " WHERE activo=TRUE"
+    sql += " ORDER BY nombre"
+    return fetchall_df(conn, sql)
+
+
+def load_lots(conn, analyte_id: int, only_active=True):
+    sql = "SELECT * FROM lotes_control WHERE analito_id=%s"
+    params: list[Any] = [analyte_id]
+    if only_active:
+        sql += " AND vigente=TRUE"
+    sql += " ORDER BY nivel, lote"
+    return fetchall_df(conn, sql, params)
+
+
+def load_results(conn, lot_id: int, limit: Optional[int] = None):
+    sql = """
+    SELECT r.*, e.nombre AS equipo_nombre, u.nombre_completo AS usuario_nombre
+    FROM resultados_cc r
+    LEFT JOIN equipos e ON e.id=r.equipo_id
+    LEFT JOIN usuarios u ON u.id=r.usuario_id
+    WHERE r.lote_control_id=%s
+    ORDER BY r.fecha ASC, r.hora ASC, r.id ASC
+    """
+    if limit:
+        sql += " LIMIT %s"
+        return fetchall_df(conn, sql, (lot_id, limit))
+    return fetchall_df(conn, sql, (lot_id,))
+
+
+def list_users(conn):
+    return fetchall_df(conn, "SELECT id,nombre_completo,username,rol,activo,cambio_password_requerido,intentos_fallidos,bloqueado_hasta,ultimo_acceso,fecha_creacion FROM usuarios ORDER BY nombre_completo")
+
+
+def list_audit(conn, limit=1000):
+    return fetchall_df(conn, "SELECT * FROM auditoria ORDER BY fecha_hora DESC LIMIT %s", (limit,))
+
+# -----------------------------------------------------------------------------
+# GRÁFICOS Y PDF
+# -----------------------------------------------------------------------------
+def levey_jennings_figure(df: pd.DataFrame, mean: float, sd: float, unit: str):
+    fig = go.Figure()
+    if not df.empty:
+        x = pd.to_datetime(df["fecha"]).dt.strftime("%d-%m-%Y")
+        fig.add_trace(go.Scatter(
+            x=x, y=df["valor"], mode="lines+markers", name="Resultado",
+            hovertemplate="%{x}<br>%{y:.4f} " + unit + "<extra></extra>",
+        ))
+    levels = [(0, "Media", "solid"), (1, "+1 DE", "dot"), (-1, "-1 DE", "dot"),
+              (2, "+2 DE", "dash"), (-2, "-2 DE", "dash"), (3, "+3 DE", "solid"), (-3, "-3 DE", "solid")]
+    for mult, label, dash in levels:
+        fig.add_hline(y=mean + mult * sd, line_dash=dash, annotation_text=label, annotation_position="right")
+    fig.update_layout(
+        height=470, margin=dict(l=20,r=20,t=30,b=20),
+        xaxis_title="Fecha", yaxis_title=unit,
+        hovermode="x unified", legend_orientation="h",
     )
+    return fig
 
 
-def cargar_resultados(conn, lote_control_id):
-    return read_sql("""
-        SELECT * FROM resultados_cc
-        WHERE lote_control_id = ?
-        ORDER BY fecha ASC, id ASC
-    """, conn, params=(lote_control_id,))
-
-
-# ----------------------------------------------------------------------
-# GENERACIÓN DE PDF
-# ----------------------------------------------------------------------
-
-def generar_grafico_lj_png(resultados_df, media, de, unidad):
-    """Genera el gráfico de Levey-Jennings como imagen PNG (para el PDF)."""
-    colores = {
-        "Aceptado": "green",
-        "Advertencia": "orange",
-        "Rechazado": "red",
-        "Pendiente": "gray",
-    }
-
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-
-    for n, alpha in [(1, 0.10), (2, 0.08), (3, 0.06)]:
-        ax.axhspan(media + (n - 1) * de, media + n * de, color="orange", alpha=alpha)
-        ax.axhspan(media - n * de, media - (n - 1) * de, color="orange", alpha=alpha)
-
-    for n, style in [(1, "dotted"), (2, "dashed"), (3, "solid")]:
-        ax.axhline(media + n * de, color="gray", linestyle=style, linewidth=0.8)
-        ax.axhline(media - n * de, color="gray", linestyle=style, linewidth=0.8)
-    ax.axhline(media, color="black", linewidth=1)
-
-    x = resultados_df["fecha"]
-    y = resultados_df["valor"]
-    puntos_color = resultados_df["estado"].map(colores).fillna("gray")
-
-    ax.plot(x, y, color="lightblue", linewidth=1, zorder=1)
-    ax.scatter(x, y, c=puntos_color, edgecolors="black", s=40, zorder=2)
-
-    ax.set_ylabel(f"Valor ({unidad})")
-    ax.set_xlabel("Fecha")
-    fig.autofmt_xdate()
-    fig.tight_layout()
-
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=150)
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-
-def generar_pdf_reporte(analito_nombre, lote_label, media, de, unidad, resultados_df):
-    """Construye un PDF con encabezado, gráfico de Levey-Jennings y la
-    tabla completa de resultados. Devuelve los bytes del PDF."""
+def generate_pdf(analyte: dict, lot: dict, results: pd.DataFrame, stats: dict) -> BytesIO:
     buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, pagesize=letter,
-        topMargin=1.5 * cm, bottomMargin=1.5 * cm,
-        leftMargin=1.5 * cm, rightMargin=1.5 * cm,
-    )
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=1.5*cm, leftMargin=1.5*cm, topMargin=1.3*cm, bottomMargin=1.3*cm)
     styles = getSampleStyleSheet()
-    elementos = []
+    title = ParagraphStyle("Title2", parent=styles["Title"], fontSize=18, leading=22, textColor=colors.HexColor("#8E1B2D"))
+    story = [
+        Paragraph("TMQuality 3.0 — Informe de Control de Calidad", title),
+        Spacer(1, .35*cm),
+        Paragraph(f"<b>Analito:</b> {analyte['nombre']} &nbsp;&nbsp; <b>Unidad:</b> {analyte['unidad']}", styles["BodyText"]),
+        Paragraph(f"<b>Lote:</b> {lot['lote']} &nbsp;&nbsp; <b>Nivel:</b> {lot['nivel']}", styles["BodyText"]),
+        Paragraph(f"<b>Objetivo:</b> {lot['media_objetivo']:.4f} ± {lot['de_objetivo']:.4f}", styles["BodyText"]),
+        Spacer(1, .3*cm),
+    ]
+    summary = [
+        ["Indicador", "Valor"],
+        ["N", str(stats.get("n", 0))],
+        ["Media observada", f"{stats['mean']:.4f}" if stats.get("mean") is not None else "—"],
+        ["DE observada", f"{stats['sd']:.4f}" if stats.get("sd") is not None else "—"],
+        ["CV%", f"{stats['cv']:.2f}%" if stats.get("cv") is not None else "—"],
+        ["Sesgo%", f"{stats['bias']:.2f}%" if stats.get("bias") is not None else "—"],
+        ["Sigma", f"{stats['sigma']:.2f}" if stats.get("sigma") is not None else "—"],
+    ]
+    t = Table(summary, colWidths=[6*cm, 5*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#8E1B2D")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("GRID", (0,0), (-1,-1), .3, colors.grey),
+        ("PADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.extend([t, Spacer(1, .4*cm)])
 
-    elementos.append(Paragraph("Reporte de Control de Calidad", styles["Title"]))
-    elementos.append(Spacer(1, 0.3 * cm))
-    elementos.append(Paragraph(f"<b>Analito:</b> {analito_nombre}", styles["Normal"]))
-    elementos.append(Paragraph(f"<b>Lote de control:</b> {lote_label}", styles["Normal"]))
-    elementos.append(Paragraph(f"<b>Media objetivo:</b> {media} {unidad}", styles["Normal"]))
-    elementos.append(Paragraph(f"<b>DE objetivo:</b> {de} {unidad}", styles["Normal"]))
-    elementos.append(Paragraph(
-        f"<b>Generado:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]
-    ))
-    elementos.append(Spacer(1, 0.5 * cm))
-
-    if not resultados_df.empty:
-        grafico_buf = generar_grafico_lj_png(resultados_df, media, de, unidad)
-        elementos.append(Image(grafico_buf, width=17 * cm, height=8.5 * cm))
-        elementos.append(Spacer(1, 0.5 * cm))
-
-        elementos.append(Paragraph("Historial de resultados", styles["Heading2"]))
-
-        encabezados = ["Fecha", "Turno", "Operador", "Valor", "Estado", "Reglas violadas"]
-        filas = [encabezados]
-        for _, row in resultados_df.iterrows():
-            filas.append([
-                str(row["fecha"].date()) if hasattr(row["fecha"], "date") else str(row["fecha"]),
-                row["turno"],
-                row["operador"],
-                f"{row['valor']:.4f}",
-                row["estado"],
-                row["reglas_violadas"] or "-",
-            ])
-
-        tabla = Table(filas, repeatRows=1, hAlign="LEFT")
-        tabla.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f2f2")]),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    if not results.empty:
+        cols = ["fecha", "turno", "operador", "valor", "estado", "reglas_violadas"]
+        data = [["Fecha","Turno","Operador","Valor","Estado","Reglas"]]
+        for _, r in results.tail(40).iterrows():
+            data.append([str(r.get(c, ""))[:28] for c in cols])
+        rt = Table(data, repeatRows=1, colWidths=[2.1*cm,1.7*cm,3.2*cm,2*cm,2.2*cm,4*cm])
+        rt.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#EDEFF2")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("GRID", (0,0), (-1,-1), .25, colors.lightgrey),
+            ("FONTSIZE", (0,0), (-1,-1), 7),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
         ]))
-        elementos.append(tabla)
-    else:
-        elementos.append(Paragraph("No hay resultados registrados para este lote.", styles["Normal"]))
-
-    doc.build(elementos)
+        story.append(rt)
+    story.append(Spacer(1, .3*cm))
+    story.append(Paragraph(f"Generado: {datetime.now():%d-%m-%Y %H:%M}", styles["BodyText"]))
+    doc.build(story)
     buffer.seek(0)
     return buffer
 
-
-# ----------------------------------------------------------------------
-# INTERFAZ
-# ----------------------------------------------------------------------
-# ----------------------------------------------------------------------
-# INTERFAZ
-# ----------------------------------------------------------------------
-
-st.set_page_config(
-    page_title="TMQuality — Control de Calidad",
-    page_icon=obtener_logo(),
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# -----------------------------------------------------------------------------
+# SESIÓN / LOGIN
+# -----------------------------------------------------------------------------
+def logout(conn):
+    if st.session_state.get("user"):
+        audit(conn, "LOGOUT", "usuarios", st.session_state.user["id"], "Cierre de sesión")
+    st.session_state.clear()
+    st.rerun()
 
 
-def aplicar_estilos():
-    st.markdown(
-        """
-        <style>
-        /* TMQuality usa las variables nativas de Streamlit. De este modo
-           Light, Dark y System cambian toda la interfaz de forma real. */
-        :root {
-            --tm-primary: var(--primary-color, #A91F34);
-            --tm-bg: var(--background-color, #FFFFFF);
-            --tm-surface: var(--secondary-background-color, #F3F5F7);
-            --tm-text: var(--text-color, #17212B);
-            --tm-muted: color-mix(in srgb, var(--tm-text) 64%, transparent);
-            --tm-border: color-mix(in srgb, var(--tm-text) 16%, transparent);
-            --tm-shadow: 0 10px 30px color-mix(in srgb, #000 13%, transparent);
-            --tm-soft-primary: color-mix(in srgb, var(--tm-primary) 13%, var(--tm-surface));
-            --tm-success: #2E9D68;
-            --tm-warning: #E49A2D;
-            --tm-danger: #E05252;
-        }
-
-        html, body, .stApp { color-scheme: light dark; }
-        [data-testid="stAppViewContainer"] {
-            color: var(--tm-text);
-            background:
-                radial-gradient(circle at 85% 0%, color-mix(in srgb, var(--tm-primary) 8%, transparent), transparent 28rem),
-                linear-gradient(180deg, var(--tm-bg), color-mix(in srgb, var(--tm-bg) 88%, var(--tm-surface)));
-        }
-        [data-testid="stHeader"] {
-            background: color-mix(in srgb, var(--tm-bg) 86%, transparent);
-            backdrop-filter: blur(12px);
-        }
-        [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, var(--tm-bg), color-mix(in srgb, var(--tm-surface) 82%, var(--tm-bg)));
-            border-right: 1px solid var(--tm-border);
-        }
-        .block-container { max-width: 1500px; padding-top: 1.25rem; padding-bottom: 3rem; }
-        h1, h2, h3, h4, p, label, span { color: var(--tm-text); }
-        h1, h2, h3 { letter-spacing: -0.02em; }
-
-        .tm-hero {
-            display:flex; align-items:center; justify-content:space-between; gap:1rem;
-            padding:1.25rem 1.4rem; margin-bottom:1.1rem; border-radius:20px;
-            color:var(--tm-text);
-            background:linear-gradient(135deg, var(--tm-surface), var(--tm-soft-primary));
-            border:1px solid var(--tm-border); box-shadow:var(--tm-shadow);
-        }
-        .tm-hero h1 { margin:0; font-size:2rem; color:var(--tm-text) !important; }
-        .tm-hero p { margin:.25rem 0 0; color:var(--tm-muted) !important; }
-        .tm-badge {
-            display:inline-flex; align-items:center; gap:.4rem; padding:.42rem .75rem;
-            border-radius:999px; background:var(--tm-bg); border:1px solid var(--tm-border);
-            color:var(--tm-text) !important; font-size:.85rem; font-weight:700; white-space:nowrap;
-        }
-        .tm-section, div[data-testid="stMetric"], div[data-testid="stForm"] {
-            background:var(--tm-surface); border:1px solid var(--tm-border);
-            border-radius:18px; box-shadow:var(--tm-shadow);
-        }
-        .tm-section { padding:1rem 1.15rem; margin-bottom:1rem; }
-        div[data-testid="stMetric"] { padding:1rem 1.15rem; }
-        div[data-testid="stForm"] { padding:1rem; }
-        div[data-testid="stMetric"] label { color:var(--tm-muted) !important; }
-        div[data-testid="stMetricValue"] { color:var(--tm-text) !important; }
-        div[data-testid="stExpander"] {
-            border:1px solid var(--tm-border); border-radius:14px; background:var(--tm-surface);
-        }
-
-        .tm-status { border-radius:14px; padding:.85rem 1rem; font-weight:650; border:1px solid transparent; }
-        .tm-ok { background:color-mix(in srgb, var(--tm-success) 16%, var(--tm-surface)); color:color-mix(in srgb, var(--tm-success) 82%, var(--tm-text)) !important; border-color:color-mix(in srgb, var(--tm-success) 40%, transparent); }
-        .tm-warn { background:color-mix(in srgb, var(--tm-warning) 16%, var(--tm-surface)); color:color-mix(in srgb, var(--tm-warning) 82%, var(--tm-text)) !important; border-color:color-mix(in srgb, var(--tm-warning) 40%, transparent); }
-        .tm-bad { background:color-mix(in srgb, var(--tm-danger) 16%, var(--tm-surface)); color:color-mix(in srgb, var(--tm-danger) 82%, var(--tm-text)) !important; border-color:color-mix(in srgb, var(--tm-danger) 40%, transparent); }
-        .tm-muted-card { background:var(--tm-surface); color:var(--tm-muted) !important; border-color:var(--tm-border); }
-        .tm-mini-title { color:var(--tm-muted) !important; font-size:.82rem; font-weight:700; text-transform:uppercase; letter-spacing:.06em; }
-        .tm-mini-value { color:var(--tm-text) !important; font-size:1.12rem; font-weight:750; margin-top:.2rem; }
-
-        .tm-kpi-card {
-            display:flex; align-items:center; gap:.85rem; background:var(--tm-surface);
-            border:1px solid var(--tm-border); border-left:5px solid var(--tm-muted);
-            border-radius:16px; padding:.95rem 1.1rem; box-shadow:var(--tm-shadow);
-            transition:transform .15s ease, box-shadow .15s ease;
-        }
-        .tm-kpi-card:hover { transform:translateY(-2px); }
-        .tm-kpi-icon { font-size:1.6rem; width:46px; height:46px; display:flex; align-items:center; justify-content:center; border-radius:12px; flex-shrink:0; background:var(--tm-soft-primary); }
-        .tm-kpi-text { line-height:1.15; }
-        .tm-kpi-value { font-size:1.55rem; font-weight:800; color:var(--tm-text) !important; }
-        .tm-kpi-label { font-size:.8rem; color:var(--tm-muted) !important; font-weight:650; text-transform:uppercase; letter-spacing:.04em; }
-        .tm-kpi-neutral { border-left-color:var(--tm-primary); }
-        .tm-kpi-ok { border-left-color:var(--tm-success); }
-        .tm-kpi-ok .tm-kpi-icon { background:color-mix(in srgb, var(--tm-success) 16%, var(--tm-surface)); }
-        .tm-kpi-warn { border-left-color:var(--tm-warning); }
-        .tm-kpi-warn .tm-kpi-icon { background:color-mix(in srgb, var(--tm-warning) 16%, var(--tm-surface)); }
-        .tm-kpi-bad { border-left-color:var(--tm-danger); }
-        .tm-kpi-bad .tm-kpi-icon { background:color-mix(in srgb, var(--tm-danger) 16%, var(--tm-surface)); }
-
-        div[data-baseweb="tab-list"] { gap:.4rem; }
-        button[data-baseweb="tab"] { border-radius:10px; padding:.65rem 1rem; color:var(--tm-muted) !important; }
-        button[data-baseweb="tab"][aria-selected="true"] { color:var(--tm-primary) !important; font-weight:750 !important; }
-
-        .stButton > button, .stDownloadButton > button {
-            border-radius:10px; font-weight:650; color:var(--tm-text);
-            background:var(--tm-surface); border:1px solid var(--tm-border);
-            transition:transform .15s ease, box-shadow .15s ease;
-        }
-        .stButton > button:hover, .stDownloadButton > button:hover { transform:translateY(-1px); box-shadow:var(--tm-shadow); }
-        .stButton > button[kind="primary"] { color:#FFF !important; background:linear-gradient(135deg, #8F1D2C, #C94A5B); border:none; }
-
-        div[data-baseweb="select"] > div, input, textarea {
-            color:var(--tm-text) !important; background:var(--tm-bg) !important; border-color:var(--tm-border) !important;
-        }
-        input::placeholder, textarea::placeholder { color:var(--tm-muted) !important; opacity:.85; }
-        [data-testid="stWidgetLabel"] p, [data-testid="stSidebar"] p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] span { color:var(--tm-text) !important; }
-        [data-testid="stSidebar"] button:disabled, [data-testid="stSidebar"] input:disabled { opacity:.55 !important; }
-
-        /* Tablas y mensajes también respetan el tema */
-        [data-testid="stDataFrame"], [data-testid="stTable"] { border-radius:14px; overflow:hidden; border:1px solid var(--tm-border); }
-        [data-testid="stAlert"] { color:var(--tm-text); border-color:var(--tm-border); }
-
-        @media (max-width: 900px) {
-            .tm-hero { align-items:flex-start; flex-direction:column; }
-            .tm-badge { white-space:normal; }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+def login_ui(conn):
+    st.markdown("""
+    <div class="tmq-hero">
+      <h1>🩸 TMQuality 3.0</h1>
+      <p>Control de calidad analítico · Westgard · Levey–Jennings · Trazabilidad</p>
+    </div>
+    """, unsafe_allow_html=True)
+    left, center, right = st.columns([1,1.1,1])
+    with center:
+        st.markdown('<div class="tmq-card">', unsafe_allow_html=True)
+        st.subheader("Acceso al sistema")
+        username = st.text_input("Usuario")
+        password = st.text_input("Contraseña", type="password")
+        if st.button("Ingresar", type="primary", use_container_width=True):
+            user, msg = authenticate(conn, username, password)
+            if user:
+                st.session_state.user = user
+                st.rerun()
+            st.error(msg)
+        st.caption("Las credenciales son individuales. Los accesos y eventos críticos quedan registrados en auditoría.")
+        st.markdown('</div>', unsafe_allow_html=True)
 
 
-init_db()
-verificar_acceso()
-aplicar_estilos()
-conn = get_connection()
-usuario_actual = st.session_state["usuario_actual"]
-
-if usuario_actual.get("debe_cambiar_password"):
-    st.warning("Por seguridad, debes crear una contraseña personal antes de continuar.")
-    _, c2, _ = st.columns([1, 1.4, 1])
-    with c2:
-        st.markdown("### Cambio obligatorio de contraseña")
-        clave_1 = st.text_input("Nueva contraseña", type="password", key="forzada_clave1")
-        clave_2 = st.text_input("Repetir contraseña", type="password", key="forzada_clave2")
-        st.caption("Mínimo 10 caracteres, con mayúscula, minúscula y número.")
-        if st.button("Guardar nueva contraseña", type="primary", use_container_width=True):
-            if clave_1 != clave_2:
-                st.error("Las contraseñas no coinciden.")
-            else:
-                try:
-                    cambiar_password(conn, usuario_actual["id"], clave_1, forzado=True)
-                    st.rerun()
-                except ValueError as exc:
-                    st.error(str(exc))
-    conn.close()
+def forced_password_change_ui(conn, user: dict):
+    st.warning("Debes cambiar tu contraseña antes de continuar.")
+    with st.form("forced_password"):
+        p1 = st.text_input("Nueva contraseña", type="password")
+        p2 = st.text_input("Repetir contraseña", type="password")
+        submitted = st.form_submit_button("Actualizar contraseña", type="primary")
+    if submitted:
+        if p1 != p2:
+            st.error("Las contraseñas no coinciden.")
+        else:
+            try:
+                change_password(conn, user["id"], p1, actor=user, require_change=False)
+                st.session_state.user = fetchone(conn, "SELECT * FROM usuarios WHERE id=%s", (user["id"],))
+                st.success("Contraseña actualizada.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
     st.stop()
 
-# Encabezado principal
-col_logo, col_hero = st.columns([0.7, 9.3], vertical_alignment="center")
-with col_logo:
-    st.image(obtener_logo(), width=72)
-with col_hero:
-    st.markdown(
-        f"""
-        <div class="tm-hero">
-            <div>
-                <h1>TMQuality</h1>
-                <p>Control de calidad analítico · Reglas de Westgard · Levey–Jennings</p>
-            </div>
-            <div class="tm-badge">● Sesión activa · {usuario_actual['rol']}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+# -----------------------------------------------------------------------------
+# COMPONENTES DE UI
+# -----------------------------------------------------------------------------
+def kpi(label: str, value: str, hint: str = ""):
+    st.markdown(f"""
+    <div class="tmq-kpi"><div class="label">{label}</div><div class="value">{value}</div><div class="hint">{hint}</div></div>
+    """, unsafe_allow_html=True)
 
-# Barra lateral
-with st.sidebar:
-    st.image(obtener_logo(), width=78)
-    st.markdown(f"### {usuario_actual['nombre_completo']}")
-    st.caption(f"{usuario_actual['rol']} · @{usuario_actual['username']}")
 
-    if st.button("Cerrar sesión", icon="🚪", use_container_width=True):
-        registrar_auditoria(conn, "LOGOUT", "sesion", usuario_actual["id"], "Cierre de sesión")
-        st.session_state["usuario_actual"] = None
+def selected_context_ui(conn):
+    analytes = load_analytes(conn)
+    if analytes.empty:
+        return None, None, None
+    analyte_map = {f"{r.nombre} · {r.unidad}": int(r.id) for r in analytes.itertuples()}
+    a_label = st.selectbox("Analito", list(analyte_map.keys()), key="global_analyte")
+    analyte_id = analyte_map[a_label]
+    analyte = fetchone(conn, "SELECT * FROM analitos WHERE id=%s", (analyte_id,))
+    lots = load_lots(conn, analyte_id)
+    if lots.empty:
+        return analyte, None, None
+    lot_map = {f"{r.nivel} · {r.lote}": int(r.id) for r in lots.itertuples()}
+    l_label = st.selectbox("Lote de control", list(lot_map.keys()), key="global_lot")
+    lot = fetchone(conn, "SELECT * FROM lotes_control WHERE id=%s", (lot_map[l_label],))
+    return analyte, lot, load_results(conn, lot["id"])
+
+# -----------------------------------------------------------------------------
+# MÓDULOS
+# -----------------------------------------------------------------------------
+def module_dashboard(conn, analyte, lot, results):
+    st.subheader("Panel de control")
+    if not analyte or not lot:
+        st.info("Crea un analito y un lote para comenzar.")
+        return
+    stats = qc_statistics(results, lot["media_objetivo"], analyte.get("error_total_permitido"))
+    accepted = int((results["estado"] == "Aceptado").sum()) if not results.empty else 0
+    warn = int((results["estado"] == "Advertencia").sum()) if not results.empty else 0
+    reject = int((results["estado"] == "Rechazado").sum()) if not results.empty else 0
+    conform = accepted / len(results) * 100 if len(results) else 0
+
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    with c1: kpi("Resultados", str(len(results)), "Total del lote")
+    with c2: kpi("Conformidad", f"{conform:.1f}%", "Aceptados / total")
+    with c3: kpi("Advertencias", str(warn), "Regla 1₂s")
+    with c4: kpi("Rechazos", str(reject), "Reglas críticas")
+    with c5: kpi("CV", f"{stats['cv']:.2f}%" if stats['cv'] is not None else "—", "Imprecisión observada")
+    with c6: kpi("Sigma", f"{stats['sigma']:.2f}" if stats['sigma'] is not None else "—", "Requiere ET permitido")
+
+    st.plotly_chart(levey_jennings_figure(results, lot["media_objetivo"], lot["de_objetivo"], analyte["unidad"]),
+                    use_container_width=True, theme="streamlit", config={"displaylogo": False})
+
+    if not results.empty:
+        recent = results.tail(10).copy()
+        st.markdown("#### Últimos resultados")
+        show = [c for c in ["fecha","turno","operador","equipo_nombre","valor","z_score","estado","reglas_violadas"] if c in recent.columns]
+        st.dataframe(recent[show].sort_values(["fecha"], ascending=False), use_container_width=True, hide_index=True)
+
+
+def module_register(conn, user, analyte, lot, results):
+    st.subheader("Registrar resultado de control")
+    if not analyte or not lot:
+        st.info("Selecciona un analito y lote vigentes.")
+        return
+    equipment = load_equipment(conn)
+    eq_map = {"Sin equipo asociado": None}
+    if not equipment.empty:
+        eq_map.update({f"{r.nombre} · {r.modelo or ''} · {r.numero_serie or ''}": int(r.id) for r in equipment.itertuples()})
+
+    with st.form("register_qc", clear_on_submit=True):
+        c1,c2,c3 = st.columns(3)
+        with c1:
+            f = st.date_input("Fecha", value=date.today())
+            turno = st.selectbox("Turno", TURNOS)
+        with c2:
+            eq_label = st.selectbox("Equipo", list(eq_map.keys()))
+            valor = st.number_input(f"Valor ({analyte['unidad']})", value=float(lot["media_objetivo"]), format="%.4f")
+        with c3:
+            comentario = st.text_area("Comentario", placeholder="Opcional")
+        submitted = st.form_submit_button("Registrar y evaluar", type="primary", use_container_width=True)
+
+    preview_z = zscore(float(valor), float(lot["media_objetivo"]), float(lot["de_objetivo"]))
+    st.caption(f"z-score estimado: {preview_z:+.2f}")
+
+    if submitted:
+        previous_z = [] if results.empty else [float(x) for x in results["z_score"].dropna().tolist()]
+        current_z = zscore(float(valor), lot["media_objetivo"], lot["de_objetivo"])
+        rules = westgard_rules(previous_z + [current_z])
+        state = state_from_rules(rules)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO resultados_cc
+                (lote_control_id,equipo_id,usuario_id,fecha,turno,operador,valor,z_score,reglas_violadas,estado,comentarios)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+                """,
+                (lot["id"], eq_map[eq_label], user["id"], f, turno, user["nombre_completo"], valor, current_z,
+                 ", ".join(rules) if rules else "", state, comentario.strip() or None),
+            )
+            rid = cur.fetchone()[0]
+        conn.commit()
+        audit(conn, "RESULTADO_REGISTRADO", "resultados_cc", rid,
+              f"{analyte['nombre']}={valor} {analyte['unidad']} | Estado={state} | Reglas={','.join(rules) or 'ninguna'}")
+        if state == "Aceptado": st.success("Resultado aceptado por las reglas configuradas.")
+        elif state == "Advertencia": st.warning(f"Advertencia: {', '.join(rules)}")
+        else: st.error(f"Resultado rechazado: {', '.join(rules)}")
         st.rerun()
 
-    with st.expander("Seguridad y acceso", icon="🔐"):
-        nueva_clave1 = st.text_input("Nueva contraseña", type="password", key="nueva_clave1")
-        nueva_clave2 = st.text_input("Repetir contraseña", type="password", key="nueva_clave2")
-        st.caption("Mínimo 10 caracteres, con mayúscula, minúscula y número.")
-        if st.button("Actualizar contraseña", use_container_width=True):
-            if nueva_clave1 != nueva_clave2:
-                st.error("Las contraseñas no coinciden.")
-            else:
+
+def module_history(conn, user, analyte, lot, results):
+    st.subheader("Historial y acciones correctivas")
+    if not lot or results.empty:
+        st.info("No hay resultados registrados para este lote.")
+        return
+    df = results.sort_values(["fecha","hora"], ascending=False).copy()
+    state_filter = st.multiselect("Estado", ESTADOS, default=[])
+    if state_filter:
+        df = df[df["estado"].isin(state_filter)]
+    st.dataframe(df[[c for c in ["id","fecha","turno","operador","equipo_nombre","valor","z_score","estado","reglas_violadas","accion_correctiva","comentarios"] if c in df.columns]],
+                 use_container_width=True, hide_index=True)
+
+    st.markdown("#### Revisión de resultado")
+    rid = st.selectbox("Resultado", df["id"].tolist(), format_func=lambda x: f"ID {x}")
+    row = df[df["id"] == rid].iloc[0]
+    with st.form("review_result"):
+        action = st.text_area("Acción correctiva", value=str(row.get("accion_correctiva") or ""))
+        comment = st.text_area("Comentario / fundamento", value=str(row.get("comentarios") or ""))
+        save = st.form_submit_button("Guardar revisión", type="primary")
+    if save:
+        execute(conn, """
+            UPDATE resultados_cc SET accion_correctiva=%s, comentarios=%s, revisado_por=%s,
+            fecha_revision=CURRENT_TIMESTAMP, fecha_modificacion=CURRENT_TIMESTAMP WHERE id=%s
+        """, (action.strip() or None, comment.strip() or None, user["id"], int(rid)))
+        audit(conn, "RESULTADO_REVISADO", "resultados_cc", rid, "Acción correctiva/comentario actualizado")
+        st.success("Revisión guardada.")
+        st.rerun()
+
+
+def module_analytics(conn, analyte, lot, results):
+    st.subheader("Analítica de desempeño")
+    if not analyte or not lot or results.empty:
+        st.info("Se requieren resultados para calcular indicadores.")
+        return
+    stats = qc_statistics(results, lot["media_objetivo"], analyte.get("error_total_permitido"))
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Media observada", f"{stats['mean']:.4f}")
+    c2.metric("DE observada", f"{stats['sd']:.4f}")
+    c3.metric("CV%", f"{stats['cv']:.2f}%" if stats['cv'] is not None else "—")
+    c4.metric("Sesgo%", f"{stats['bias']:.2f}%" if stats['bias'] is not None else "—")
+    if analyte.get("error_total_permitido") is None:
+        st.info("Define el Error Total Permitido (%) del analito para calcular Sigma.")
+    else:
+        sigma = stats["sigma"]
+        st.metric("Métrica Sigma", f"{sigma:.2f}" if sigma is not None else "—", help="(ET permitido − |sesgo|) / CV")
+
+    temp = results.copy()
+    temp["fecha"] = pd.to_datetime(temp["fecha"])
+    temp["mes"] = temp["fecha"].dt.to_period("M").astype(str)
+    monthly = temp.groupby("mes").agg(media=("valor","mean"), de=("valor","std"), n=("valor","count")).reset_index()
+    monthly["cv"] = monthly["de"] / monthly["media"] * 100
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=monthly["mes"], y=monthly["cv"], name="CV%"))
+    fig.update_layout(height=360, title="CV% por mes", yaxis_title="CV%")
+    st.plotly_chart(fig, use_container_width=True, theme="streamlit", config={"displaylogo": False})
+
+
+def module_equipment(conn, user):
+    st.subheader("Equipos")
+    equipment = load_equipment(conn, only_active=False)
+    if not equipment.empty:
+        st.dataframe(equipment, use_container_width=True, hide_index=True)
+    if user["rol"] not in ["Administrador","Supervisor"]:
+        return
+    with st.expander("➕ Registrar equipo"):
+        with st.form("new_equipment"):
+            c1,c2 = st.columns(2)
+            with c1:
+                name = st.text_input("Nombre del equipo")
+                manufacturer = st.text_input("Fabricante")
+                model = st.text_input("Modelo")
+            with c2:
+                serial = st.text_input("Número de serie")
+                area = st.text_input("Área")
+                location = st.text_input("Ubicación")
+            submit = st.form_submit_button("Guardar equipo", type="primary")
+        if submit:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                    INSERT INTO equipos(nombre,fabricante,modelo,numero_serie,area,ubicacion)
+                    VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
+                    """, (name.strip(), manufacturer.strip() or None, model.strip() or None, serial.strip() or None, area.strip() or None, location.strip() or None))
+                    eid = cur.fetchone()[0]
+                conn.commit()
+                audit(conn, "EQUIPO_CREADO", "equipos", eid, name)
+                st.success("Equipo registrado.")
+                st.rerun()
+            except IntegrityError:
+                conn.rollback(); st.error("El número de serie ya existe.")
+
+
+def module_reports(conn, analyte, lot, results):
+    st.subheader("Reportes y exportación")
+    if not analyte or not lot:
+        st.info("Selecciona un analito y lote.")
+        return
+    stats = qc_statistics(results, lot["media_objetivo"], analyte.get("error_total_permitido"))
+    c1,c2 = st.columns(2)
+    with c1:
+        pdf = generate_pdf(analyte, lot, results, stats)
+        st.download_button("📄 Descargar informe PDF", pdf,
+                           file_name=f"TMQuality_{analyte['nombre']}_{lot['lote']}.pdf".replace(" ","_"),
+                           mime="application/pdf", use_container_width=True)
+    with c2:
+        csv = results.to_csv(index=False).encode("utf-8-sig") if not results.empty else b""
+        st.download_button("📊 Descargar CSV", csv,
+                           file_name=f"TMQuality_{analyte['nombre']}_{lot['lote']}.csv".replace(" ","_"),
+                           mime="text/csv", use_container_width=True)
+
+
+def module_audit(conn):
+    st.subheader("Auditoría")
+    df = list_audit(conn, 5000)
+    if df.empty:
+        st.info("Aún no hay eventos de auditoría.")
+        return
+    c1,c2,c3 = st.columns(3)
+    users = sorted([x for x in df["username"].dropna().unique().tolist()])
+    actions = sorted(df["accion"].dropna().unique().tolist())
+    with c1: uf = st.multiselect("Usuario", users)
+    with c2: af = st.multiselect("Acción", actions)
+    with c3: only_failed = st.checkbox("Solo eventos fallidos")
+    filtered = df.copy()
+    if uf: filtered = filtered[filtered["username"].isin(uf)]
+    if af: filtered = filtered[filtered["accion"].isin(af)]
+    if only_failed: filtered = filtered[filtered["exito"] == False]
+    st.dataframe(filtered, use_container_width=True, hide_index=True)
+    st.download_button("Exportar auditoría CSV", filtered.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"auditoria_TMQuality_{date.today()}.csv", mime="text/csv")
+
+
+def module_admin(conn, user):
+    st.subheader("Administración")
+    if user["rol"] != "Administrador":
+        st.info("Disponible solo para Administradores.")
+        return
+    users = list_users(conn)
+    st.markdown("#### Usuarios")
+    st.dataframe(users, use_container_width=True, hide_index=True)
+
+    with st.expander("➕ Crear usuario"):
+        with st.form("new_user"):
+            nombre = st.text_input("Nombre completo")
+            username = st.text_input("Usuario")
+            role = st.selectbox("Rol", ROLES)
+            temp_pw = st.text_input("Contraseña temporal", type="password")
+            create = st.form_submit_button("Crear usuario", type="primary")
+        if create:
+            try:
+                create_user(conn, nombre, username, temp_pw, role, require_change=True, actor=user)
+                st.success("Usuario creado. Deberá cambiar su contraseña al ingresar.")
+                st.rerun()
+            except IntegrityError:
+                conn.rollback(); st.error("Ese nombre de usuario ya existe.")
+            except Exception as exc:
+                st.error(str(exc))
+
+    st.markdown("#### Gestionar usuario")
+    if not users.empty:
+        uid = st.selectbox("Usuario", users["id"].tolist(), format_func=lambda x: users.loc[users.id==x,"username"].iloc[0])
+        target = users[users.id==uid].iloc[0].to_dict()
+        c1,c2,c3 = st.columns(3)
+        with c1:
+            new_role = st.selectbox("Rol", ROLES, index=ROLES.index(target["rol"]) if target["rol"] in ROLES else 2, key="admin_role")
+            if st.button("Actualizar rol", use_container_width=True):
+                execute(conn, "UPDATE usuarios SET rol=%s, fecha_modificacion=CURRENT_TIMESTAMP WHERE id=%s", (new_role, int(uid)))
+                audit(conn, "ROL_CAMBIADO", "usuarios", uid, f"{target['rol']} → {new_role}")
+                st.rerun()
+        with c2:
+            label = "Desactivar" if target["activo"] else "Reactivar"
+            if st.button(label, use_container_width=True):
+                if target["rol"] == "Administrador" and target["activo"] and active_admin_count(conn) <= 1:
+                    st.error("No se puede desactivar al último Administrador activo.")
+                elif int(uid) == int(user["id"]) and target["activo"]:
+                    st.error("No puedes desactivar tu propia sesión.")
+                else:
+                    execute(conn, "UPDATE usuarios SET activo=%s, fecha_modificacion=CURRENT_TIMESTAMP WHERE id=%s", (not bool(target["activo"]), int(uid)))
+                    audit(conn, "USUARIO_REACTIVADO" if not target["activo"] else "USUARIO_DESACTIVADO", "usuarios", uid, None)
+                    st.rerun()
+        with c3:
+            reset_pw = st.text_input("Nueva contraseña temporal", type="password", key="reset_pw")
+            if st.button("Restablecer contraseña", use_container_width=True):
                 try:
-                    cambiar_password(conn, usuario_actual["id"], nueva_clave1)
-                    st.success("Contraseña actualizada.")
-                except ValueError as exc:
+                    change_password(conn, int(uid), reset_pw, actor=user, require_change=True)
+                    st.success("Contraseña restablecida. Se exigirá cambio al próximo ingreso.")
+                except Exception as exc:
                     st.error(str(exc))
 
-    if usuario_actual["rol"] == "Administrador":
-        with st.expander("Gestión de usuarios", icon="👥"):
-            st.caption("Las cuentas nuevas deben cambiar su contraseña en el primer ingreso.")
-            with st.form("form_usuario", clear_on_submit=True):
-                nombre_nuevo_usr = st.text_input("Nombre completo")
-                username_nuevo = st.text_input("Usuario")
-                password_nuevo = st.text_input("Contraseña temporal", type="password")
-                rol_nuevo = st.selectbox("Rol", ["Operador", "Supervisor", "Administrador"])
-                crear_usr = st.form_submit_button("Crear usuario", use_container_width=True)
-            if crear_usr:
-                if not (nombre_nuevo_usr and username_nuevo and password_nuevo):
-                    st.warning("Completa todos los campos.")
-                else:
-                    try:
-                        crear_usuario(conn, nombre_nuevo_usr, username_nuevo, password_nuevo,
-                                     rol_nuevo, creado_por=usuario_actual["id"])
-                        st.success(f"Usuario '@{username_nuevo.strip().lower()}' creado.")
-                        st.rerun()
-                    except IntegrityError:
-                        conn.rollback()
-                        st.error("Ese nombre de usuario ya existe.")
-                    except ValueError as exc:
-                        st.error(str(exc))
-
-            usuarios_df = listar_usuarios(conn)
-            for _, u in usuarios_df.iterrows():
-                estado_icono = "🟢" if u["activo"] else "⚪"
-                ultimo = "Nunca" if pd.isna(u["ultimo_acceso"]) else pd.to_datetime(u["ultimo_acceso"]).strftime("%d-%m-%Y %H:%M")
-                st.markdown(f"**{estado_icono} {u['nombre_completo']}** · @{u['username']}")
-                st.caption(f"{u['rol']} · Último acceso: {ultimo} · Intentos fallidos: {int(u['intentos_fallidos'] or 0)}")
-                crol, cestado = st.columns(2)
-                with crol:
-                    roles = ["Operador", "Supervisor", "Administrador"]
-                    nuevo_rol = st.selectbox("Rol", roles, index=roles.index(u["rol"]), key=f"rol_usr_{u['id']}", label_visibility="collapsed")
-                    if nuevo_rol != u["rol"] and st.button("Aplicar rol", key=f"aplicar_rol_{u['id']}", use_container_width=True):
-                        try:
-                            cambiar_rol_usuario(conn, int(u["id"]), nuevo_rol)
-                            st.rerun()
-                        except ValueError as exc:
-                            st.error(str(exc))
-                with cestado:
-                    if u["activo"]:
-                        if st.button("Desactivar", key=f"desact_{u['id']}", use_container_width=True):
-                            if int(u["id"]) == usuario_actual["id"]:
-                                st.error("No puedes desactivar tu propia cuenta.")
-                            else:
-                                try:
-                                    set_usuario_activo(conn, int(u["id"]), False)
-                                    st.rerun()
-                                except ValueError as exc:
-                                    st.error(str(exc))
-                    elif st.button("Reactivar", key=f"react_{u['id']}", use_container_width=True):
-                        try:
-                            set_usuario_activo(conn, int(u["id"]), True)
-                            st.rerun()
-                        except ValueError as exc:
-                            st.error(str(exc))
-                with st.expander("Restablecer contraseña", expanded=False):
-                    temporal = st.text_input("Contraseña temporal", type="password", key=f"temp_{u['id']}")
-                    if st.button("Restablecer", key=f"reset_{u['id']}", use_container_width=True):
-                        try:
-                            resetear_password_usuario(conn, int(u["id"]), temporal)
-                            st.success("Contraseña temporal asignada; se exigirá cambio al ingresar.")
-                        except ValueError as exc:
-                            st.error(str(exc))
-                st.divider()
-
     st.divider()
-    st.markdown("### Contexto de análisis")
-    analitos_df = cargar_analitos(conn)
-
-    with st.expander("Nuevo analito", icon="➕"):
-        with st.form("form_analito", clear_on_submit=True):
-            nuevo_nombre = st.text_input("Nombre del analito")
-            nueva_unidad = st.text_input("Unidad", placeholder="g/dL, %, mg/dL…")
-            guardar_analito = st.form_submit_button("Guardar analito", use_container_width=True)
-        if guardar_analito:
-            if nuevo_nombre and nueva_unidad:
+    st.markdown("#### Maestros de calidad")
+    tab_a, tab_l = st.tabs(["Analitos", "Lotes de control"])
+    with tab_a:
+        analytes = load_analytes(conn, only_active=False)
+        if not analytes.empty: st.dataframe(analytes, use_container_width=True, hide_index=True)
+        with st.form("new_analyte"):
+            n = st.text_input("Nombre")
+            unit = st.text_input("Unidad")
+            method = st.text_input("Metodología")
+            tea = st.number_input("Error Total Permitido (%)", min_value=0.0, value=0.0, step=0.1, help="Usa 0 si aún no está definido.")
+            add = st.form_submit_button("Crear analito")
+        if add:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO analitos(nombre,unidad,metodologia,error_total_permitido) VALUES(%s,%s,%s,%s) RETURNING id",
+                                (n.strip(), unit.strip(), method.strip() or None, tea if tea > 0 else None))
+                    aid = cur.fetchone()[0]
+                conn.commit(); audit(conn,"ANALITO_CREADO","analitos",aid,n); st.rerun()
+            except IntegrityError:
+                conn.rollback(); st.error("El analito ya existe.")
+    with tab_l:
+        analytes = load_analytes(conn)
+        if analytes.empty:
+            st.info("Primero crea un analito.")
+        else:
+            amap = {f"{r.nombre} ({r.unidad})":int(r.id) for r in analytes.itertuples()}
+            with st.form("new_lot"):
+                al = st.selectbox("Analito", list(amap.keys()))
+                level = st.selectbox("Nivel", ["Bajo","Normal","Alto"])
+                lot_code = st.text_input("Lote")
+                mfg = st.text_input("Fabricante")
+                material = st.text_input("Material de control")
+                expiry = st.date_input("Vencimiento", value=date.today()+timedelta(days=365))
+                mean = st.number_input("Media objetivo", value=1.0, format="%.4f")
+                sd = st.number_input("DE objetivo", min_value=0.000001, value=0.1, format="%.4f")
+                create_lot = st.form_submit_button("Crear lote")
+            if create_lot:
                 try:
-                    cur_a = conn.execute("INSERT INTO analitos (nombre, unidad) VALUES (?, ?) RETURNING id", (nuevo_nombre, nueva_unidad))
-                    analito_nuevo_id = cur_a.fetchone()[0]
-                    registrar_auditoria(conn, "CREAR_ANALITO", "analitos", analito_nuevo_id, f"{nuevo_nombre} · {nueva_unidad}", commit=False)
-                    conn.commit()
-                    st.success(f"Analito '{nuevo_nombre}' agregado.")
-                    st.rerun()
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                        INSERT INTO lotes_control(analito_id,nivel,lote,fabricante,material_control,fecha_vencimiento,media_objetivo,de_objetivo)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+                        """, (amap[al],level,lot_code.strip(),mfg.strip() or None,material.strip() or None,expiry,mean,sd))
+                        lid=cur.fetchone()[0]
+                    conn.commit(); audit(conn,"LOTE_CREADO","lotes_control",lid,lot_code); st.rerun()
                 except IntegrityError:
-                    conn.rollback()
-                    st.warning("Ese analito ya existe.")
-            else:
-                st.warning("Completa nombre y unidad.")
+                    conn.rollback(); st.error("Ese lote ya existe para el analito/nivel seleccionado.")
 
-    if analitos_df.empty:
-        st.info("Agrega un analito para comenzar.")
-        st.stop()
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+conn = get_connection()
+init_db(conn)
+bootstrap_admin_ui(conn)
 
-    analito_sel = st.selectbox("Analito", analitos_df["nombre"])
-    analito_id = int(analitos_df[analitos_df.nombre == analito_sel]["id"].iloc[0])
-    unidad = analitos_df[analitos_df.nombre == analito_sel]["unidad"].iloc[0]
-    lotes_df = cargar_lotes(conn, analito_id)
+if "user" not in st.session_state:
+    login_ui(conn)
+    st.stop()
 
-    with st.expander("Nuevo lote de control", icon="🧪"):
-        with st.form("form_lote", clear_on_submit=True):
-            nivel_nuevo = st.selectbox("Nivel", ["Bajo", "Normal", "Alto"])
-            lote_nuevo = st.text_input("Identificador de lote")
-            media_nueva = st.number_input("Media objetivo", format="%.4f")
-            de_nueva = st.number_input("DE objetivo", format="%.4f", min_value=0.0001)
-            guardar_lote = st.form_submit_button("Guardar lote", use_container_width=True)
-        if guardar_lote:
-            if lote_nuevo:
-                try:
-                    cur_l = conn.execute(
-                        """INSERT INTO lotes_control
-                           (analito_id, nivel, lote, media_objetivo, de_objetivo)
-                           VALUES (?, ?, ?, ?, ?) RETURNING id""",
-                        (analito_id, nivel_nuevo, lote_nuevo, media_nueva, de_nueva),
-                    )
-                    lote_nuevo_id = cur_l.fetchone()[0]
-                    registrar_auditoria(conn, "CREAR_LOTE", "lotes_control", lote_nuevo_id, f"{nivel_nuevo} · {lote_nuevo}", commit=False)
-                    conn.commit()
-                    st.success("Lote agregado.")
-                    st.rerun()
-                except IntegrityError:
-                    conn.rollback()
-                    st.warning("Ese lote/nivel ya existe para este analito.")
-            else:
-                st.warning("Ingresa un identificador de lote.")
+user = st.session_state.user
+# Refrescar estado del usuario cada ejecución (permite desactivación inmediata).
+fresh = fetchone(conn, "SELECT * FROM usuarios WHERE id=%s", (user["id"],))
+if not fresh or not fresh["activo"]:
+    st.session_state.clear()
+    st.error("Tu cuenta ya no está activa.")
+    st.stop()
+st.session_state.user = fresh
+user = fresh
 
-    if lotes_df.empty:
-        st.info("Agrega un lote de control para este analito.")
-        st.stop()
+if user.get("cambio_password_requerido"):
+    forced_password_change_ui(conn, user)
 
-    lotes_df["etiqueta"] = lotes_df["nivel"] + " — " + lotes_df["lote"]
-    lote_sel_label = st.selectbox("Lote de control", lotes_df["etiqueta"])
-    lote_row = lotes_df[lotes_df.etiqueta == lote_sel_label].iloc[0]
-    lote_id = int(lote_row["id"])
-    media = float(lote_row["media_objetivo"])
-    de = float(lote_row["de_objetivo"])
+with st.sidebar:
+    st.markdown("## 🩸 TMQuality")
+    st.caption(f"Versión {APP_VERSION}")
+    st.markdown(f"**{user['nombre_completo']}**")
+    st.caption(f"{user['rol']} · @{user['username']}")
+    if user.get("ultimo_acceso"):
+        st.caption(f"Último acceso: {user['ultimo_acceso']:%d-%m-%Y %H:%M}")
+    if st.button("Cerrar sesión", use_container_width=True):
+        logout(conn)
+    st.divider()
+    analyte, lot, results = selected_context_ui(conn)
+    if analyte and lot:
+        st.markdown("##### Parámetros objetivo")
+        st.write(f"**μ:** {lot['media_objetivo']:.4f} {analyte['unidad']}")
+        st.write(f"**DE:** {lot['de_objetivo']:.4f} {analyte['unidad']}")
+        if lot.get("fecha_vencimiento"):
+            exp = lot["fecha_vencimiento"]
+            if exp < date.today(): st.error(f"Lote vencido: {exp:%d-%m-%Y}")
+            elif exp <= date.today()+timedelta(days=30): st.warning(f"Vence: {exp:%d-%m-%Y}")
 
-    st.markdown(
-        f"""
-        <div class="tm-section">
-          <div class="tm-mini-title">Parámetros objetivo</div>
-          <div class="tm-mini-value">μ {media:.4f} {unidad}</div>
-          <div class="tm-mini-value">σ {de:.4f} {unidad}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+st.markdown(f"""
+<div class="tmq-hero">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap">
+    <div><h1>TMQuality 3.0</h1><p>Control de calidad analítico · Westgard · Levey–Jennings · Sigma · Auditoría</p></div>
+    <span class="tmq-badge">● Sesión activa · {user['rol']}</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-    with st.expander("Herramientas del lote", icon="⚙️"):
-        n_resultados_lote = conn.execute(
-            "SELECT COUNT(*) FROM resultados_cc WHERE lote_control_id = ?", (lote_id,)
-        ).fetchone()[0]
-        st.caption(f"Este lote contiene {n_resultados_lote} resultado(s).")
-        if st.button("Recalcular reglas", key=f"recalc_{lote_id}", use_container_width=True):
-            n_actualizados = recalcular_reglas_lote(conn, lote_id, media, de)
-            st.success(f"Se recalcularon {n_actualizados} resultado(s).")
-            st.rerun()
-        confirmar_lote = st.checkbox("Confirmo eliminación permanente", key=f"confirmar_lote_{lote_id}")
-        if st.button("Eliminar lote", key=f"del_lote_{lote_id}", disabled=not confirmar_lote, use_container_width=True):
-            if usuario_actual["rol"] not in ("Administrador", "Supervisor"):
-                st.error("Tu rol no permite eliminar lotes.")
-            else:
-                registrar_auditoria(conn, "ELIMINAR_LOTE", "lotes_control", lote_id, f"{analito_sel} · {lote_sel_label}", commit=False)
-                conn.execute("DELETE FROM resultados_cc WHERE lote_control_id = ?", (lote_id,))
-                conn.execute("DELETE FROM lotes_control WHERE id = ?", (lote_id,))
-                conn.commit()
-                st.success("Lote eliminado.")
-                st.rerun()
+modules = ["📊 Panel", "➕ Registrar", "📋 Historial", "📈 Analítica", "🧪 Equipos", "📄 Reportes"]
+if user["rol"] in ["Administrador","Supervisor"]:
+    modules.append("🧾 Auditoría")
+if user["rol"] == "Administrador":
+    modules.append("⚙️ Administración")
 
-# Datos del lote seleccionado
-resultados_df = cargar_resultados(conn, lote_id)
-if not resultados_df.empty:
-    resultados_df["fecha"] = pd.to_datetime(resultados_df["fecha"])
-    resultados_df = resultados_df.sort_values(["fecha", "id"])
-
-n_total = len(resultados_df)
-n_aceptados = int((resultados_df["estado"] == "Aceptado").sum()) if n_total else 0
-n_advertencias = int((resultados_df["estado"] == "Advertencia").sum()) if n_total else 0
-n_rechazados = int((resultados_df["estado"] == "Rechazado").sum()) if n_total else 0
-conformidad = (n_aceptados / n_total * 100) if n_total else 0
-ultimo_valor = float(resultados_df.iloc[-1]["valor"]) if n_total else None
-ultimo_z = ((ultimo_valor - media) / de) if ultimo_valor is not None and de else None
-
-# Indicadores rápidos: tarjetas KPI con color + medidor de conformidad
-def _kpi_card(icono, valor, etiqueta, clase):
-    st.markdown(
-        f"""
-        <div class="tm-kpi-card {clase}">
-            <div class="tm-kpi-icon">{icono}</div>
-            <div class="tm-kpi-text">
-                <div class="tm-kpi-value">{valor}</div>
-                <div class="tm-kpi-label">{etiqueta}</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-col_kpis, col_gauge = st.columns([2.6, 1])
-with col_kpis:
-    fila1a, fila1b = st.columns(2)
-    fila2a, fila2b = st.columns(2)
-    with fila1a:
-        _kpi_card("🧪", n_total, "Resultados", "tm-kpi-neutral")
-    with fila1b:
-        _kpi_card("✅", n_aceptados, "Aceptados", "tm-kpi-ok")
-    with fila2a:
-        _kpi_card("⚠️", n_advertencias, "Advertencias", "tm-kpi-warn" if n_advertencias else "tm-kpi-neutral")
-    with fila2b:
-        _kpi_card("⛔", n_rechazados, "Rechazados", "tm-kpi-bad" if n_rechazados else "tm-kpi-neutral")
-
-with col_gauge:
-    if n_total:
-        if conformidad >= 95:
-            color_gauge = "#21845A"
-        elif conformidad >= 80:
-            color_gauge = "#C77A16"
-        else:
-            color_gauge = "#C0392B"
-
-        fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=conformidad,
-            number={"suffix": "%", "font": {"size": 34}},
-            gauge={
-                "axis": {"range": [0, 100]},
-                "bar": {"color": color_gauge, "thickness": 0.28},
-                "bgcolor": "rgba(0,0,0,0)",
-                "borderwidth": 0,
-                "steps": [
-                    {"range": [0, 80], "color": "#FFF0EE"},
-                    {"range": [80, 95], "color": "#FFF7E8"},
-                    {"range": [95, 100], "color": "#EDF8F3"},
-                ],
-            },
-        ))
-        fig_gauge.update_layout(
-            template="streamlit", height=190, margin=dict(l=15, r=15, t=15, b=5),
-            paper_bgcolor="rgba(0,0,0,0)",
-            font=dict(family="Arial, sans-serif"),
-        )
-        st.plotly_chart(fig_gauge, use_container_width=True, config={"displayModeBar": False})
-        st.markdown(
-            f"<p style='text-align:center; color:var(--tm-muted); margin-top:-0.6rem; font-size:.85rem;'>"
-            f"Conformidad del lote · último z-score {ultimo_z:+.2f}</p>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.info("Sin datos aún para calcular conformidad.")
-
-if n_total:
-    ultimo_estado = resultados_df.iloc[-1]["estado"]
-    ultimo_reglas = resultados_df.iloc[-1]["reglas_violadas"] or "Sin reglas violadas"
-    clase_estado = {"Aceptado": "tm-ok", "Advertencia": "tm-warn", "Rechazado": "tm-bad"}.get(ultimo_estado, "tm-muted-card")
-    st.markdown(
-        f'<div class="tm-status {clase_estado}">Último resultado: {ultimo_estado} · {ultimo_valor:.4f} {unidad} · {ultimo_reglas}</div>',
-        unsafe_allow_html=True,
-    )
-
-# Navegación principal
-if usuario_actual["rol"] in ("Administrador", "Supervisor"):
-    tab_panel, tab_registro, tab_historial, tab_reportes, tab_auditoria = st.tabs(
-        ["📊 Panel de control", "➕ Registrar resultado", "🧾 Historial y acciones", "📥 Reportes", "🧾 Auditoría"]
-    )
-else:
-    tab_panel, tab_registro, tab_historial, tab_reportes = st.tabs(
-        ["📊 Panel de control", "➕ Registrar resultado", "🧾 Historial", "📥 Reportes"]
-    )
-    tab_auditoria = None
-
-with tab_panel:
-    st.markdown("### Gráfico de Levey–Jennings")
-    if resultados_df.empty:
-        st.info("Aún no hay resultados registrados para este lote.")
-    else:
-        fig = go.Figure()
-        bandas = [
-            (-3, -2, "rgba(192,57,43,0.11)"), (-2, -1, "rgba(199,122,22,0.10)"),
-            (-1, 1, "rgba(33,132,90,0.10)"), (1, 2, "rgba(199,122,22,0.10)"),
-            (2, 3, "rgba(192,57,43,0.11)"),
-        ]
-        for z0, z1, color in bandas:
-            fig.add_hrect(y0=media + z0 * de, y1=media + z1 * de, fillcolor=color, line_width=0)
-
-        for n, dash, color in [(1, "dot", "#81909A"), (2, "dash", "#A16A15"), (3, "solid", "#A52A20")]:
-            fig.add_hline(y=media + n * de, line_dash=dash, line_color=color, line_width=1)
-            fig.add_hline(y=media - n * de, line_dash=dash, line_color=color, line_width=1)
-        fig.add_hline(y=media, line_color="#26333B", line_width=2, annotation_text="Media")
-
-        color_map = {"Aceptado": "#21845A", "Advertencia": "#D98A1A", "Rechazado": "#C0392B", "Pendiente": "#87949C"}
-        symbol_map = {"Aceptado": "circle", "Advertencia": "diamond", "Rechazado": "x", "Pendiente": "circle-open"}
-        point_colors = resultados_df["estado"].map(color_map).fillna("#87949C")
-        point_symbols = resultados_df["estado"].map(symbol_map).fillna("circle")
-
-        fig.add_trace(go.Scatter(
-            x=resultados_df["fecha"], y=resultados_df["valor"], mode="lines+markers",
-            marker=dict(color=point_colors, symbol=point_symbols, size=11, line=dict(width=1.5, color="white")),
-            line=dict(color="#6FA8BD", width=2.5),
-            customdata=resultados_df[["estado", "turno", "operador", "reglas_violadas"]].fillna(""),
-            hovertemplate=(
-                "<b>%{x|%d-%m-%Y}</b><br>Valor: %{y:.4f} " + unidad +
-                "<br>Estado: %{customdata[0]}<br>Turno: %{customdata[1]}" +
-                "<br>Operador: %{customdata[2]}<br>Reglas: %{customdata[3]}<extra></extra>"
-            ),
-            name="Resultados",
-        ))
-        fig.update_layout(
-            height=540, margin=dict(l=20, r=20, t=25, b=20),
-            template="streamlit", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(family="Arial, sans-serif"),
-            xaxis=dict(title="Fecha", showgrid=False, rangeslider=dict(visible=True, thickness=0.06)),
-            yaxis=dict(title=f"Valor ({unidad})", gridcolor="rgba(128,128,128,0.22)"),
-            hovermode="x unified", showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
-
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.markdown("#### Distribución por estado")
-            estado_counts = resultados_df["estado"].value_counts().reindex(["Aceptado", "Advertencia", "Rechazado", "Pendiente"]).fillna(0)
-            fig_estado = go.Figure(go.Bar(
-                x=estado_counts.index, y=estado_counts.values,
-                marker_color=[color_map.get(x, "#87949C") for x in estado_counts.index],
-                text=estado_counts.values, textposition="auto",
-            ))
-            fig_estado.update_layout(
-                height=300, margin=dict(l=10,r=10,t=10,b=10),
-                template="streamlit", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(family="Arial, sans-serif"),
-                yaxis=dict(title="Cantidad", gridcolor="rgba(128,128,128,0.22)"),
-            )
-            st.plotly_chart(fig_estado, use_container_width=True, config={"displayModeBar": False})
-        with c2:
-            st.markdown("#### Lectura rápida")
-            st.markdown(
-                f"""
-                <div class="tm-section">
-                  <div class="tm-mini-title">Analito</div><div class="tm-mini-value">{analito_sel}</div><br>
-                  <div class="tm-mini-title">Lote</div><div class="tm-mini-value">{lote_sel_label}</div><br>
-                  <div class="tm-mini-title">Rango ±3 DE</div><div class="tm-mini-value">{media-3*de:.4f} – {media+3*de:.4f} {unidad}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-with tab_registro:
-    st.markdown("### Registrar nuevo resultado")
-    st.caption("El sistema evaluará automáticamente la serie completa y aplicará las reglas de Westgard.")
-    with st.form("form_resultado", clear_on_submit=False):
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            fecha_ing = st.date_input("Fecha", value=date.today())
-        with col2:
-            turno_ing = st.selectbox("Turno", ["Mañana", "Tarde", "Noche"])
-        with col3:
-            st.text_input("Operador", value=usuario_actual["nombre_completo"], disabled=True)
-            operador_ing = usuario_actual["nombre_completo"]
-        with col4:
-            valor_ing = st.number_input(f"Valor ({unidad})", format="%.4f")
-
-        z_preview = (valor_ing - media) / de if de else 0
-        if abs(z_preview) > 3:
-            st.markdown(f'<div class="tm-status tm-bad">Vista previa: {z_preview:+.2f} DE · fuera de ±3 DE</div>', unsafe_allow_html=True)
-        elif abs(z_preview) > 2:
-            st.markdown(f'<div class="tm-status tm-warn">Vista previa: {z_preview:+.2f} DE · zona de advertencia</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="tm-status tm-ok">Vista previa: {z_preview:+.2f} DE · dentro del rango esperado</div>', unsafe_allow_html=True)
-
-        registrar = st.form_submit_button("Registrar y evaluar resultado", type="primary", use_container_width=True)
-
-    if registrar:
-        hist_df = cargar_resultados(conn, lote_id)
-        valores_previos = hist_df["valor"].tolist() if not hist_df.empty else []
-        serie_completa = valores_previos + [valor_ing]
-        violadas = evaluar_westgard(serie_completa, media, de)
-        hay_rechazo = any(REGLAS[r][1] == "rechazo" for r in violadas)
-        estado = "Rechazado" if hay_rechazo else ("Advertencia" if violadas else "Aceptado")
-        cur_r = conn.execute(
-            """INSERT INTO resultados_cc
-               (lote_control_id, fecha, turno, operador, valor, reglas_violadas, estado)
-               VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id""",
-            (lote_id, str(fecha_ing), turno_ing, operador_ing, valor_ing,
-             ", ".join(violadas) if violadas else None, estado),
-        )
-        resultado_nuevo_id = cur_r.fetchone()[0]
-        registrar_auditoria(conn, "REGISTRAR_RESULTADO", "resultados_cc", resultado_nuevo_id,
-                            f"{analito_sel} · {lote_sel_label} · {valor_ing:.4f} {unidad} · {estado}", commit=False)
-        conn.commit()
-        st.session_state["ultimo_registro_mensaje"] = (estado, violadas)
-        st.rerun()
-
-    if st.session_state.get("ultimo_registro_mensaje"):
-        estado_msg, violadas_msg = st.session_state.pop("ultimo_registro_mensaje")
-        if estado_msg == "Rechazado":
-            st.error(f"Corrida rechazada. Reglas violadas: {', '.join(violadas_msg)}")
-        elif estado_msg == "Advertencia":
-            st.warning(f"Resultado con advertencia: {', '.join(violadas_msg)}")
-        else:
-            st.success("Resultado registrado dentro de control.")
-
-with tab_historial:
-    st.markdown("### Historial y acciones correctivas")
-    if resultados_df.empty:
-        st.info("No hay resultados disponibles.")
-    else:
-        f1, f2, f3 = st.columns([1, 1, 2])
-        with f1:
-            filtro_estado = st.multiselect("Estado", ["Aceptado", "Advertencia", "Rechazado", "Pendiente"], default=["Aceptado", "Advertencia", "Rechazado", "Pendiente"])
-        with f2:
-            filtro_turno = st.multiselect("Turno", sorted(resultados_df["turno"].dropna().unique()), default=sorted(resultados_df["turno"].dropna().unique()))
-        with f3:
-            buscar_operador = st.text_input("Buscar operador", placeholder="Nombre del operador")
-
-        filtrados = resultados_df[resultados_df["estado"].isin(filtro_estado) & resultados_df["turno"].isin(filtro_turno)].copy()
-        if buscar_operador:
-            filtrados = filtrados[filtrados["operador"].str.contains(buscar_operador, case=False, na=False)]
-
-        st.dataframe(
-            filtrados[["fecha", "turno", "operador", "valor", "estado", "reglas_violadas", "accion_correctiva"]],
-            use_container_width=True, hide_index=True,
-            column_config={
-                "fecha": st.column_config.DatetimeColumn("Fecha", format="DD-MM-YYYY"),
-                "valor": st.column_config.NumberColumn(f"Valor ({unidad})", format="%.4f"),
-                "estado": st.column_config.TextColumn("Estado"),
-            },
-        )
-
-        no_conformes = resultados_df[resultados_df["estado"].isin(["Rechazado", "Advertencia"])].sort_values("fecha", ascending=False)
-        st.markdown("#### No conformidades y seguimiento")
-        if no_conformes.empty:
-            st.success("No hay advertencias ni rechazos pendientes de revisión.")
-        for _, row in no_conformes.iterrows():
-            icono = "⛔" if row["estado"] == "Rechazado" else "⚠️"
-            with st.expander(f"{icono} {row['fecha'].date()} · {row['estado']} · {row['valor']:.4f} {unidad}"):
-                st.caption(f"Operador: {row['operador']} · Turno: {row['turno']} · Reglas: {row['reglas_violadas']}")
-                nueva_accion = st.text_area("Acción correctiva / observación", value=row["accion_correctiva"] or "", key=f"accion_{row['id']}")
-                ca, cb = st.columns([3, 1])
-                with ca:
-                    if st.button("Guardar acción", key=f"btn_accion_{row['id']}", use_container_width=True):
-                        if usuario_actual["rol"] not in ("Administrador", "Supervisor"):
-                            st.error("Tu rol no permite modificar acciones correctivas.")
-                        else:
-                            conn.execute("UPDATE resultados_cc SET accion_correctiva = ? WHERE id = ?", (nueva_accion, int(row["id"])))
-                            registrar_auditoria(conn, "ACTUALIZAR_ACCION_CORRECTIVA", "resultados_cc", int(row["id"]),
-                                                nueva_accion[:500] if nueva_accion else "Acción vacía", commit=False)
-                            conn.commit()
-                            st.success("Acción guardada.")
-                            st.rerun()
-                with cb:
-                    if st.button("Eliminar", key=f"del_result_{row['id']}", use_container_width=True,
-                                 disabled=usuario_actual["rol"] not in ("Administrador", "Supervisor")):
-                        registrar_auditoria(conn, "ELIMINAR_RESULTADO", "resultados_cc", int(row["id"]),
-                                            f"{row['fecha'].date()} · {row['valor']:.4f} {unidad}", commit=False)
-                        conn.execute("DELETE FROM resultados_cc WHERE id = ?", (int(row["id"]),))
-                        conn.commit()
-                        st.rerun()
-
-        with st.expander("Eliminación masiva de resultados", icon="🗑️"):
-            tabla_editable = resultados_df[["id", "fecha", "turno", "operador", "valor", "estado", "reglas_violadas", "accion_correctiva"]].copy()
-            tabla_editable.insert(0, "Eliminar", False)
-            tabla_resultado = st.data_editor(
-                tabla_editable, use_container_width=True, hide_index=True,
-                disabled=["id", "fecha", "turno", "operador", "valor", "estado", "reglas_violadas", "accion_correctiva"],
-                key="editor_resultados",
-            )
-            ids_a_eliminar = tabla_resultado.loc[tabla_resultado["Eliminar"], "id"].tolist()
-            if ids_a_eliminar:
-                st.warning(f"Se eliminarán {len(ids_a_eliminar)} resultado(s).")
-                if st.button("Confirmar eliminación", key="confirmar_delete_masivo", type="primary",
-                             disabled=usuario_actual["rol"] not in ("Administrador", "Supervisor")):
-                    registrar_auditoria(conn, "ELIMINAR_RESULTADOS_MASIVO", "resultados_cc", None,
-                                        f"IDs: {', '.join(map(str, ids_a_eliminar[:50]))}", commit=False)
-                    conn.executemany("DELETE FROM resultados_cc WHERE id = ?", [(int(i),) for i in ids_a_eliminar])
-                    conn.commit()
-                    st.rerun()
-
-with tab_reportes:
-    st.markdown("### Reportes y exportación")
-    if resultados_df.empty:
-        st.info("Registra resultados antes de generar reportes.")
-    else:
-        st.caption("Exporta el análisis seleccionado para respaldo, auditoría o revisión del supervisor.")
-        col_pdf, col_csv = st.columns(2)
-        with col_pdf:
-            pdf_buffer = generar_pdf_reporte(analito_sel, lote_sel_label, media, de, unidad, resultados_df)
-            st.download_button(
-                "Descargar reporte PDF", data=pdf_buffer,
-                file_name=f"reporte_cc_{analito_sel}_{lote_sel_label}.pdf".replace(" ", "_"),
-                mime="application/pdf", use_container_width=True,
-            )
-        with col_csv:
-            csv_data = resultados_df[["fecha", "turno", "operador", "valor", "estado", "reglas_violadas", "accion_correctiva"]].to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "Descargar base CSV", data=csv_data,
-                file_name=f"tabla_cc_{analito_sel}_{lote_sel_label}.csv".replace(" ", "_"),
-                mime="text/csv", use_container_width=True,
-            )
-
-        st.markdown("#### Resumen del lote")
-        resumen = pd.DataFrame({
-            "Indicador": ["Analito", "Lote", "Media objetivo", "DE objetivo", "Resultados", "Aceptados", "Advertencias", "Rechazados", "Conformidad"],
-            "Valor": [analito_sel, lote_sel_label, f"{media:.4f} {unidad}", f"{de:.4f} {unidad}", n_total, n_aceptados, n_advertencias, n_rechazados, f"{conformidad:.1f}%"],
-        })
-        st.dataframe(resumen, use_container_width=True, hide_index=True)
-
-
-if tab_auditoria is not None:
-    with tab_auditoria:
-        st.markdown("### Registro de auditoría")
-        st.caption("Trazabilidad de accesos, usuarios y cambios críticos. Las contraseñas nunca se registran.")
-        auditoria_df = cargar_auditoria(conn, 1000)
-        if auditoria_df.empty:
-            st.info("Aún no hay eventos de auditoría.")
-        else:
-            fa1, fa2, fa3 = st.columns(3)
-            with fa1:
-                opts_usr = ["Todos"] + sorted([x for x in auditoria_df["username"].dropna().unique().tolist() if x])
-                aud_usr = st.selectbox("Usuario", opts_usr, key="aud_usr")
-            with fa2:
-                opts_acc = ["Todas"] + sorted(auditoria_df["accion"].dropna().unique().tolist())
-                aud_acc = st.selectbox("Acción", opts_acc, key="aud_acc")
-            with fa3:
-                aud_fallos = st.checkbox("Solo fallidos", key="aud_fallos")
-            aud_filtrada = auditoria_df.copy()
-            if aud_usr != "Todos":
-                aud_filtrada = aud_filtrada[aud_filtrada["username"] == aud_usr]
-            if aud_acc != "Todas":
-                aud_filtrada = aud_filtrada[aud_filtrada["accion"] == aud_acc]
-            if aud_fallos:
-                aud_filtrada = aud_filtrada[aud_filtrada["exito"] == False]
-            st.dataframe(aud_filtrada, use_container_width=True, hide_index=True,
-                         column_config={"fecha_hora": st.column_config.DatetimeColumn("Fecha/hora", format="DD-MM-YYYY HH:mm:ss")})
-            st.download_button("Descargar auditoría CSV",
-                               data=aud_filtrada.to_csv(index=False).encode("utf-8-sig"),
-                               file_name=f"auditoria_tmquality_{date.today().isoformat()}.csv",
-                               mime="text/csv", use_container_width=True)
+tabs = st.tabs(modules)
+for label, tab in zip(modules, tabs):
+    with tab:
+        if label == "📊 Panel": module_dashboard(conn, analyte, lot, results if results is not None else pd.DataFrame())
+        elif label == "➕ Registrar": module_register(conn, user, analyte, lot, results if results is not None else pd.DataFrame())
+        elif label == "📋 Historial": module_history(conn, user, analyte, lot, results if results is not None else pd.DataFrame())
+        elif label == "📈 Analítica": module_analytics(conn, analyte, lot, results if results is not None else pd.DataFrame())
+        elif label == "🧪 Equipos": module_equipment(conn, user)
+        elif label == "📄 Reportes": module_reports(conn, analyte, lot, results if results is not None else pd.DataFrame())
+        elif label == "🧾 Auditoría": module_audit(conn)
+        elif label == "⚙️ Administración": module_admin(conn, user)
 
 conn.close()
