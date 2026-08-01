@@ -182,8 +182,48 @@ def fetchall_df(conn, sql: str, params: Optional[Iterable[Any]] = None) -> pd.Da
     return pd.DataFrame([dict(r) for r in rows])
 
 
+def _column_exists(conn, table: str, column: str) -> bool:
+    row = fetchone(
+        conn,
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=%s AND column_name=%s
+        ) AS ok
+        """,
+        (table, column),
+    )
+    return bool(row and row.get("ok"))
+
+
+def _table_exists(conn, table: str) -> bool:
+    row = fetchone(
+        conn,
+        "SELECT to_regclass(%s) IS NOT NULL AS ok",
+        (f"public.{table}",),
+    )
+    return bool(row and row.get("ok"))
+
+
 def init_db(conn):
-    """Crea/migra el esquema sin borrar datos existentes."""
+    """Inicializa TMQuality sin bloquear los reruns de Streamlit.
+
+    La versión 3.0 original ejecutaba ALTER TABLE, constraints y cambios de RLS
+    en cada rerun. PostgreSQL puede requerir locks exclusivos para esas
+    operaciones, por lo que una sesión concurrente podía dejar la app
+    aparentemente cargando indefinidamente. Esta versión:
+      * crea solo tablas que aún no existen;
+      * agrega únicamente columnas realmente faltantes;
+      * usa lock_timeout/statement_timeout cortos;
+      * no modifica RLS ni privilegios durante el arranque normal.
+    """
+    try:
+        execute(conn, "SET lock_timeout TO '3s'")
+        execute(conn, "SET statement_timeout TO '12s'")
+    except Exception:
+        conn.rollback()
+
     ddl = [
         """
         CREATE TABLE IF NOT EXISTS analitos (
@@ -279,62 +319,68 @@ def init_db(conn):
         )
         """,
     ]
-    for sql in ddl:
-        execute(conn, sql)
 
-    migrations = [
-        "ALTER TABLE analitos ADD COLUMN IF NOT EXISTS metodologia TEXT",
-        "ALTER TABLE analitos ADD COLUMN IF NOT EXISTS error_total_permitido DOUBLE PRECISION",
-        "ALTER TABLE analitos ADD COLUMN IF NOT EXISTS activo BOOLEAN NOT NULL DEFAULT TRUE",
-        "ALTER TABLE analitos ADD COLUMN IF NOT EXISTS fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
-        "ALTER TABLE lotes_control ADD COLUMN IF NOT EXISTS fabricante TEXT",
-        "ALTER TABLE lotes_control ADD COLUMN IF NOT EXISTS material_control TEXT",
-        "ALTER TABLE lotes_control ADD COLUMN IF NOT EXISTS fecha_vencimiento DATE",
-        "ALTER TABLE lotes_control ADD COLUMN IF NOT EXISTS fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
-        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cambio_password_requerido BOOLEAN NOT NULL DEFAULT TRUE",
-        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS intentos_fallidos INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS bloqueado_hasta TIMESTAMP",
-        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ultimo_acceso TIMESTAMP",
-        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fecha_modificacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
-        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS equipo_id BIGINT REFERENCES equipos(id) ON DELETE SET NULL",
-        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS usuario_id BIGINT REFERENCES usuarios(id) ON DELETE SET NULL",
-        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS hora TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
-        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS z_score DOUBLE PRECISION",
-        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS comentarios TEXT",
-        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS revisado_por BIGINT REFERENCES usuarios(id) ON DELETE SET NULL",
-        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS fecha_revision TIMESTAMP",
-        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
-        "ALTER TABLE resultados_cc ADD COLUMN IF NOT EXISTS fecha_modificacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+    for sql in ddl:
+        try:
+            execute(conn, sql)
+        except Exception as exc:
+            conn.rollback()
+            st.error("No fue posible verificar/crear el esquema de TMQuality.")
+            st.code(str(exc))
+            st.stop()
+
+    # Migraciones idempotentes: solo se ejecuta ALTER TABLE si falta la columna.
+    missing_columns = [
+        ("analitos", "metodologia", "TEXT"),
+        ("analitos", "error_total_permitido", "DOUBLE PRECISION"),
+        ("analitos", "activo", "BOOLEAN NOT NULL DEFAULT TRUE"),
+        ("analitos", "fecha_creacion", "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+        ("lotes_control", "fabricante", "TEXT"),
+        ("lotes_control", "material_control", "TEXT"),
+        ("lotes_control", "fecha_vencimiento", "DATE"),
+        ("lotes_control", "fecha_creacion", "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+        ("usuarios", "cambio_password_requerido", "BOOLEAN NOT NULL DEFAULT TRUE"),
+        ("usuarios", "intentos_fallidos", "INTEGER NOT NULL DEFAULT 0"),
+        ("usuarios", "bloqueado_hasta", "TIMESTAMP"),
+        ("usuarios", "ultimo_acceso", "TIMESTAMP"),
+        ("usuarios", "fecha_modificacion", "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+        ("resultados_cc", "equipo_id", "BIGINT REFERENCES equipos(id) ON DELETE SET NULL"),
+        ("resultados_cc", "usuario_id", "BIGINT REFERENCES usuarios(id) ON DELETE SET NULL"),
+        ("resultados_cc", "hora", "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+        ("resultados_cc", "z_score", "DOUBLE PRECISION"),
+        ("resultados_cc", "comentarios", "TEXT"),
+        ("resultados_cc", "revisado_por", "BIGINT REFERENCES usuarios(id) ON DELETE SET NULL"),
+        ("resultados_cc", "fecha_revision", "TIMESTAMP"),
+        ("resultados_cc", "fecha_creacion", "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+        ("resultados_cc", "fecha_modificacion", "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+    ]
+
+    for table, column, definition in missing_columns:
+        try:
+            if not _column_exists(conn, table, column):
+                execute(conn, f'ALTER TABLE public.{table} ADD COLUMN {column} {definition}')
+        except Exception as exc:
+            conn.rollback()
+            st.error(f"La migración de la columna {table}.{column} no pudo completarse.")
+            st.code(str(exc))
+            st.info("Espera unos segundos, reinicia la app y vuelve a intentarlo. Si persiste, ejecuta la migración SQL una sola vez desde Supabase.")
+            st.stop()
+
+    index_sql = [
         "CREATE INDEX IF NOT EXISTS idx_lotes_analito ON lotes_control(analito_id)",
         "CREATE INDEX IF NOT EXISTS idx_resultados_lote_fecha ON resultados_cc(lote_control_id, fecha)",
         "CREATE INDEX IF NOT EXISTS idx_resultados_equipo ON resultados_cc(equipo_id)",
         "CREATE INDEX IF NOT EXISTS idx_auditoria_fecha ON auditoria(fecha_hora DESC)",
         "CREATE INDEX IF NOT EXISTS idx_auditoria_usuario ON auditoria(usuario_id)",
     ]
-    for sql in migrations:
+    for sql in index_sql:
         try:
             execute(conn, sql)
         except Exception:
             conn.rollback()
 
-    # Ajustar constraint de roles si proviene de una versión anterior.
-    try:
-        execute(conn, "ALTER TABLE usuarios DROP CONSTRAINT IF EXISTS usuarios_rol_check")
-        execute(conn, "ALTER TABLE usuarios ADD CONSTRAINT usuarios_rol_check CHECK (rol IN ('Administrador','Supervisor','Operador'))")
-    except Exception:
-        conn.rollback()
-
-    # Tablas solo se usan por conexión servidor-servidor. No se exponen por PostgREST.
-    # Esto evita un falso sentido de seguridad por RLS sin políticas y reduce superficie pública.
-    for table in ["analitos", "equipos", "lotes_control", "resultados_cc", "usuarios", "auditoria"]:
-        for sql in [
-            f"ALTER TABLE public.{table} DISABLE ROW LEVEL SECURITY",
-            f"REVOKE ALL ON TABLE public.{table} FROM anon, authenticated",
-        ]:
-            try:
-                execute(conn, sql)
-            except Exception:
-                conn.rollback()
+    # No modificar RLS, GRANT/REVOKE ni constraints globales durante un rerun.
+    # Esas tareas administrativas deben hacerse una sola vez desde Supabase.
 
 # -----------------------------------------------------------------------------
 # SEGURIDAD / USUARIOS
