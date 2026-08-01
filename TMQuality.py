@@ -1395,6 +1395,73 @@ def module_dashboard(conn, analyte, lot, results):
     with b: kpi("Conformidad", f"{conform:.1f}%", f"{accepted} de {len(results)} aceptados", "good" if conform >= 90 else "warn")
     with c: kpi("Resultados", str(len(results)), f"{reject} rechazo(s) · {warn} advertencia(s)", "bad" if reject else "info")
 
+    # ------------------------------------------------------------------
+    # Alerta accionable cuando el lote requiere revisión
+    # ------------------------------------------------------------------
+    if state == "REVISAR LOTE":
+        reasons = []
+        if reject:
+            reasons.append(f"{reject} resultado(s) rechazado(s)")
+        if warn:
+            reasons.append(f"{warn} advertencia(s)")
+        reason_text = " · ".join(reasons) if reasons else "Se detectaron resultados que requieren revisión."
+
+        st.warning(
+            f"**Este lote requiere revisión.** {reason_text}. "
+            "Revisa la secuencia antes de aceptar nuevas corridas de control."
+        )
+
+        act1, act2, act3 = st.columns(3)
+
+        with act1:
+            if st.button(
+                "Ver resultados críticos",
+                use_container_width=True,
+                key=f"review_results_{int(lot['id'])}",
+            ):
+                st.session_state.main_nav = "Resultados"
+                st.rerun()
+
+        with act2:
+            if st.button(
+                "↻ Recalcular lote",
+                use_container_width=True,
+                key=f"review_recalc_{int(lot['id'])}",
+            ):
+                try:
+                    n_updated = recalcular_reglas_lote(
+                        conn,
+                        int(lot["id"]),
+                        float(lot["media_objetivo"]),
+                        float(lot["de_objetivo"]),
+                    )
+                    audit(
+                        conn,
+                        "LOTE_RECALCULADO",
+                        "resultados_cc",
+                        int(lot["id"]),
+                        f"Reevaluación cronológica de {n_updated} resultado(s)",
+                    )
+                    st.success(f"Se recalcularon {n_updated} resultado(s).")
+                    st.rerun()
+                except Exception as exc:
+                    conn.rollback()
+                    st.error(f"No fue posible recalcular el lote: {exc}")
+
+        with act3:
+            if user := st.session_state.get("user"):
+                if user["rol"] == "Administrador":
+                    if st.button(
+                        "＋ Crear nuevo lote",
+                        use_container_width=True,
+                        key=f"review_new_lot_{int(lot['id'])}",
+                    ):
+                        st.session_state.new_lot_analyte_id = int(analyte["id"])
+                        st.session_state.main_nav = "Lotes de control"
+                        st.rerun()
+                else:
+                    st.caption("Solicita a un Administrador la creación de un nuevo lote.")
+
     st.markdown('<div class="tmq-section">Control de calidad</div>', unsafe_allow_html=True)
     st.plotly_chart(levey_jennings_figure(results, lot["media_objetivo"], lot["de_objetivo"], analyte["unidad"]), use_container_width=True, theme=None, config={"displaylogo": False, "modeBarButtonsToRemove":["lasso2d","select2d"]})
 
@@ -1629,6 +1696,182 @@ def module_audit(conn):
                        file_name=f"auditoria_TMQuality_{date.today()}.csv", mime="text/csv")
 
 
+
+def module_lots(conn, user):
+    st.subheader("Lotes de control")
+    st.caption(
+        "Gestiona los lotes de material de control. Los Administradores pueden crear "
+        "nuevos lotes; Supervisores pueden revisar los lotes existentes."
+    )
+
+    analytes_all = load_analytes(conn)
+    if analytes_all.empty:
+        st.info("Primero debes crear al menos un analito.")
+        return
+
+    # Resumen de lotes existentes.
+    lots_df = fetchall_df(
+        conn,
+        """
+        SELECT
+            l.id,
+            a.nombre AS analito,
+            a.unidad,
+            l.nivel,
+            l.lote,
+            l.fabricante,
+            l.material_control,
+            l.media_objetivo,
+            l.de_objetivo,
+            l.fecha_vencimiento,
+            l.vigente,
+            l.fecha_creacion
+        FROM lotes_control l
+        JOIN analitos a ON a.id=l.analito_id
+        ORDER BY a.nombre, l.nivel, l.fecha_creacion DESC
+        """
+    )
+
+    if not lots_df.empty:
+        today = pd.Timestamp(date.today())
+        lots_view = lots_df.copy()
+        lots_view["fecha_vencimiento"] = pd.to_datetime(lots_view["fecha_vencimiento"], errors="coerce")
+        lots_view["estado"] = "Vigente"
+        lots_view.loc[lots_view["vigente"] == False, "estado"] = "Inactivo"
+        lots_view.loc[
+            (lots_view["vigente"] == True)
+            & lots_view["fecha_vencimiento"].notna()
+            & (lots_view["fecha_vencimiento"] < today),
+            "estado"
+        ] = "Vencido"
+
+        show_cols = [
+            "analito", "nivel", "lote", "fabricante", "material_control",
+            "media_objetivo", "de_objetivo", "fecha_vencimiento", "estado"
+        ]
+        st.dataframe(lots_view[show_cols], use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    if user["rol"] != "Administrador":
+        st.info("La creación y modificación de lotes está disponible para Administradores.")
+        return
+
+    st.markdown("#### Crear nuevo lote")
+    amap = {f"{r.nombre} · {r.unidad}": int(r.id) for r in analytes_all.itertuples()}
+
+    # Si la navegación vino desde una alerta de lote, preseleccionar el analito actual.
+    default_index = 0
+    preferred_analyte = st.session_state.get("new_lot_analyte_id")
+    if preferred_analyte:
+        for i, aid in enumerate(amap.values()):
+            if int(aid) == int(preferred_analyte):
+                default_index = i
+                break
+
+    with st.form("new_lot_main", clear_on_submit=True):
+        al = st.selectbox("Analito", list(amap.keys()), index=default_index)
+        c1, c2 = st.columns(2)
+        with c1:
+            level = st.selectbox("Nivel", ["Bajo", "Normal", "Alto"])
+            lot_code = st.text_input("Código / número de lote", placeholder="Ej.: LOTE-2026-02")
+            mfg = st.text_input("Fabricante")
+            material = st.text_input("Material de control")
+        with c2:
+            expiry = st.date_input("Fecha de vencimiento", value=date.today() + timedelta(days=365))
+            mean = st.number_input("Media objetivo", value=1.0, format="%.4f")
+            sd = st.number_input("DE objetivo", min_value=0.000001, value=0.1, format="%.4f")
+            deactivate_previous = st.checkbox(
+                "Desactivar otros lotes vigentes del mismo analito y nivel",
+                value=False,
+                help="Úsalo cuando el nuevo lote reemplaza al anterior."
+            )
+
+        create_lot = st.form_submit_button("Crear lote de control", type="primary", use_container_width=True)
+
+    if create_lot:
+        if not lot_code.strip():
+            st.error("Debes ingresar el código o número de lote.")
+        else:
+            try:
+                with conn.cursor() as cur:
+                    if deactivate_previous:
+                        cur.execute(
+                            """
+                            UPDATE lotes_control
+                            SET vigente=FALSE
+                            WHERE analito_id=%s AND nivel=%s AND vigente=TRUE
+                            """,
+                            (amap[al], level),
+                        )
+
+                    cur.execute(
+                        """
+                        INSERT INTO lotes_control(
+                            analito_id,nivel,lote,fabricante,material_control,
+                            fecha_vencimiento,media_objetivo,de_objetivo,vigente
+                        )
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,TRUE)
+                        RETURNING id
+                        """,
+                        (
+                            amap[al], level, lot_code.strip(),
+                            mfg.strip() or None, material.strip() or None,
+                            expiry, mean, sd
+                        ),
+                    )
+                    lid = cur.fetchone()[0]
+
+                conn.commit()
+                audit(
+                    conn,
+                    "LOTE_CREADO",
+                    "lotes_control",
+                    lid,
+                    f"{lot_code.strip()} · {level} · {al}"
+                )
+                st.session_state.pop("new_lot_analyte_id", None)
+                st.success(f"Lote {lot_code.strip()} creado correctamente.")
+                st.rerun()
+
+            except IntegrityError:
+                conn.rollback()
+                st.error("Ese lote ya existe para el analito y nivel seleccionados.")
+            except Exception as exc:
+                conn.rollback()
+                st.error(f"No fue posible crear el lote: {exc}")
+
+    # Gestión rápida del estado de un lote.
+    if not lots_df.empty:
+        st.divider()
+        st.markdown("#### Activar o desactivar lote")
+        lot_options = {
+            f"{r.analito} · {r.nivel} · {r.lote}": int(r.id)
+            for r in lots_df.itertuples()
+        }
+        selected_label = st.selectbox("Lote", list(lot_options.keys()), key="lot_manage_select")
+        selected_id = lot_options[selected_label]
+        selected_row = lots_df[lots_df["id"] == selected_id].iloc[0]
+
+        action_label = "Desactivar lote" if bool(selected_row["vigente"]) else "Reactivar lote"
+        if st.button(action_label, use_container_width=True):
+            new_state = not bool(selected_row["vigente"])
+            execute(
+                conn,
+                "UPDATE lotes_control SET vigente=%s WHERE id=%s",
+                (new_state, selected_id),
+            )
+            audit(
+                conn,
+                "LOTE_REACTIVADO" if new_state else "LOTE_DESACTIVADO",
+                "lotes_control",
+                selected_id,
+                selected_label,
+            )
+            st.rerun()
+
+
+
 def module_admin(conn, user):
     st.subheader("Administración")
     if user["rol"] != "Administrador":
@@ -1768,9 +2011,16 @@ with st.sidebar:
     if st.button("Cerrar sesión", use_container_width=True): logout(conn)
     st.divider()
     nav = ["Inicio", "Control de calidad", "Resultados", "Analítica", "Equipos", "Reportes"]
-    if user["rol"] in ["Administrador","Supervisor"]: nav.append("Auditoría")
-    if user["rol"] == "Administrador": nav.append("Administración")
-    page = st.radio("Navegación", nav, label_visibility="collapsed")
+    if user["rol"] in ["Administrador","Supervisor"]:
+        nav.append("Lotes de control")
+        nav.append("Auditoría")
+    if user["rol"] == "Administrador":
+        nav.append("Administración")
+
+    # Mantener una navegación controlable desde botones de acción.
+    if "main_nav" not in st.session_state or st.session_state.main_nav not in nav:
+        st.session_state.main_nav = "Inicio"
+    page = st.radio("Navegación", nav, label_visibility="collapsed", key="main_nav")
     st.divider()
     analyte, lot, results = selected_context_ui(conn)
     if analyte and lot:
@@ -1790,6 +2040,7 @@ elif page == "Resultados": module_history(conn, user, analyte, lot, empty)
 elif page == "Analítica": module_analytics(conn, analyte, lot, empty)
 elif page == "Equipos": module_equipment(conn, user)
 elif page == "Reportes": module_reports(conn, analyte, lot, empty)
+elif page == "Lotes de control": module_lots(conn, user)
 elif page == "Auditoría": module_audit(conn)
 elif page == "Administración": module_admin(conn, user)
 
