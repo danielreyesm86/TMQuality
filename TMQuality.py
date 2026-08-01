@@ -1406,9 +1406,34 @@ def module_dashboard(conn, analyte, lot, results):
             reasons.append(f"{warn} advertencia(s)")
         reason_text = " · ".join(reasons) if reasons else "Se detectaron resultados que requieren revisión."
 
-        st.warning(
-            f"**Este lote requiere revisión.** {reason_text}. "
-            "Revisa la secuencia antes de aceptar nuevas corridas de control."
+        st.markdown(
+            f"""
+            <div style="
+                display:flex; align-items:flex-start; gap:14px;
+                padding:16px 18px; margin:10px 0 14px 0;
+                background:#FFF4CC; border:1px solid #E8C34A;
+                border-left:5px solid #C98A00; border-radius:12px;
+                color:#3F3100 !important;">
+                <div style="
+                    min-width:28px; width:28px; height:28px;
+                    display:flex; align-items:center; justify-content:center;
+                    border-radius:50%; background:#C98A00;
+                    color:#FFFFFF !important; font-weight:800;">!</div>
+                <div>
+                    <div style="
+                        color:#493600 !important; font-size:15px;
+                        font-weight:800; margin-bottom:3px;">
+                        Este lote requiere revisión
+                    </div>
+                    <div style="
+                        color:#5C4707 !important; font-size:14px;
+                        font-weight:550; line-height:1.5;">
+                        {reason_text}. Revisa la secuencia antes de aceptar nuevas corridas de control.
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
         act1, act2, act3 = st.columns(3)
