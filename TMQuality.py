@@ -466,7 +466,10 @@ def init_db():
     # se pueda explorar de inmediato)
     cur.execute("SELECT COUNT(*) FROM analitos")
     if cur.fetchone()[0] == 0:
-        seed_demo_data(conn)
+        try:
+            seed_demo_data(conn)
+        except sqlite3.IntegrityError:
+            pass
 
     # Usuario administrador por defecto, solo si no existe ningún usuario
     # todavía. La clave inicial se puede definir en Streamlit secrets
@@ -478,7 +481,12 @@ def init_db():
             clave_inicial = st.secrets["admin_password"]
         except Exception:
             clave_inicial = "admin123"
-        crear_usuario(conn, "Administrador", "admin", clave_inicial, "Administrador")
+        try:
+            crear_usuario(conn, "Administrador", "admin", clave_inicial, "Administrador")
+        except sqlite3.IntegrityError:
+            # Otra sesión ya lo creó justo antes (init_db corre en cada
+            # rerun de Streamlit); no es un error real, lo ignoramos.
+            pass
 
     conn.close()
 
