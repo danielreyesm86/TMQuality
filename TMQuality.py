@@ -942,6 +942,67 @@ def state_from_rules(rules: list[str]) -> str:
     return "Aceptado"
 
 
+def recalcular_reglas_lote(conn, lote_control_id: int, media: float, de: float) -> int:
+    """
+    Recalcula cronológicamente todos los resultados de un lote.
+
+    Actualiza:
+    - z_score
+    - reglas_violadas
+    - estado
+
+    Es especialmente útil después de agregar, modificar o eliminar resultados,
+    ya que varias reglas de Westgard dependen de los puntos anteriores.
+    """
+    df = fetchall_df(
+        conn,
+        """
+        SELECT id, fecha, valor
+        FROM resultados_cc
+        WHERE lote_control_id=%s
+        ORDER BY fecha ASC, id ASC
+        """,
+        (int(lote_control_id),),
+    )
+
+    if df.empty:
+        return 0
+
+    z_acumulados: list[float] = []
+    actualizaciones = []
+
+    for _, row in df.iterrows():
+        current_z = zscore(float(row["valor"]), float(media), float(de))
+        z_acumulados.append(current_z)
+
+        rules = westgard_rules(z_acumulados)
+        estado = state_from_rules(rules)
+
+        actualizaciones.append(
+            (
+                current_z,
+                ", ".join(rules) if rules else "",
+                estado,
+                int(row["id"]),
+            )
+        )
+
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            UPDATE resultados_cc
+            SET z_score=%s,
+                reglas_violadas=%s,
+                estado=%s,
+                fecha_modificacion=CURRENT_TIMESTAMP
+            WHERE id=%s
+            """,
+            actualizaciones,
+        )
+    conn.commit()
+    return len(actualizaciones)
+
+
 def qc_statistics(df: pd.DataFrame, target_mean: float, allowable_error: Optional[float]) -> dict:
     if df.empty:
         return {"n": 0, "mean": None, "sd": None, "cv": None, "bias": None, "sigma": None}
@@ -1027,52 +1088,179 @@ def levey_jennings_figure(df: pd.DataFrame, mean: float, sd: float, unit: str):
     return fig
 
 
+def levey_jennings_pdf_image(results: pd.DataFrame, mean: float, sd: float, unit: str) -> BytesIO:
+    """Genera una imagen PNG del gráfico Levey-Jennings para incrustarla en el PDF."""
+    image_buffer = BytesIO()
+
+    fig, ax = plt.subplots(figsize=(10.2, 4.4), dpi=170)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    if not results.empty:
+        df_plot = results.copy()
+        df_plot["fecha"] = pd.to_datetime(df_plot["fecha"], errors="coerce")
+        df_plot = df_plot.dropna(subset=["fecha", "valor"]).sort_values(["fecha", "id"] if "id" in df_plot.columns else ["fecha"])
+        x = list(range(len(df_plot)))
+        y = pd.to_numeric(df_plot["valor"], errors="coerce").tolist()
+
+        ax.plot(
+            x, y,
+            color="#1769D2",
+            linewidth=2.0,
+            marker="o",
+            markersize=5.2,
+            markerfacecolor="#FFFFFF",
+            markeredgecolor="#1769D2",
+            markeredgewidth=1.4,
+            zorder=4,
+        )
+
+        # Resaltar visualmente advertencias y rechazos.
+        for i, (_, row) in enumerate(df_plot.iterrows()):
+            estado = str(row.get("estado", ""))
+            if estado == "Rechazado":
+                ax.scatter(i, row["valor"], s=46, color="#EF334E", edgecolor="white", linewidth=0.8, zorder=6)
+            elif estado == "Advertencia":
+                ax.scatter(i, row["valor"], s=46, color="#D99113", edgecolor="white", linewidth=0.8, zorder=6)
+
+        labels = df_plot["fecha"].dt.strftime("%d-%m-%Y").tolist()
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=7.2)
+
+    # Líneas de referencia Westgard / Levey-Jennings.
+    reference_lines = [
+        (0, "Media", "#13233F", "-", 1.7),
+        (1, "+1 DE", "#8DA0B8", ":", 1.1),
+        (-1, "-1 DE", "#8DA0B8", ":", 1.1),
+        (2, "+2 DE", "#D99113", "--", 1.25),
+        (-2, "-2 DE", "#D99113", "--", 1.25),
+        (3, "+3 DE", "#EF334E", "-", 1.35),
+        (-3, "-3 DE", "#EF334E", "-", 1.35),
+    ]
+
+    for mult, label, color, style, width in reference_lines:
+        y_ref = mean + mult * sd
+        ax.axhline(y_ref, color=color, linestyle=style, linewidth=width, zorder=1)
+        ax.text(
+            1.003, y_ref, label,
+            transform=ax.get_yaxis_transform(),
+            va="center", ha="left",
+            fontsize=7.2, color=color,
+        )
+
+    ax.set_title("Gráfico de Levey-Jennings", loc="left", fontsize=12, fontweight="bold", color="#14213D", pad=10)
+    ax.set_xlabel("Fecha", fontsize=8.5, color="#56647A")
+    ax.set_ylabel(unit, fontsize=8.5, color="#56647A")
+    ax.grid(axis="y", color="#E9EEF5", linewidth=0.8, alpha=0.95)
+    ax.grid(axis="x", visible=False)
+    ax.tick_params(colors="#68758A", labelsize=7.5)
+
+    for spine in ["top", "right", "left"]:
+        ax.spines[spine].set_visible(False)
+    ax.spines["bottom"].set_color("#DDE3EC")
+
+    # Asegurar espacio para etiquetas de referencia a la derecha.
+    fig.subplots_adjust(left=0.075, right=0.91, top=0.86, bottom=0.26)
+    fig.savefig(image_buffer, format="png", dpi=170, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    image_buffer.seek(0)
+    return image_buffer
+
+
 def generate_pdf(analyte: dict, lot: dict, results: pd.DataFrame, stats: dict) -> BytesIO:
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=1.5*cm, leftMargin=1.5*cm, topMargin=1.3*cm, bottomMargin=1.3*cm)
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=1.5*cm,
+        leftMargin=1.5*cm,
+        topMargin=1.3*cm,
+        bottomMargin=1.3*cm,
+    )
     styles = getSampleStyleSheet()
-    title = ParagraphStyle("Title2", parent=styles["Title"], fontSize=18, leading=22, textColor=colors.HexColor("#8E1B2D"))
+    title = ParagraphStyle(
+        "Title2",
+        parent=styles["Title"],
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor("#14213D"),
+        spaceAfter=4,
+    )
+    section = ParagraphStyle(
+        "SectionTMQ",
+        parent=styles["Heading2"],
+        fontSize=11.5,
+        leading=14,
+        textColor=colors.HexColor("#14213D"),
+        spaceBefore=4,
+        spaceAfter=7,
+    )
+
     story = [
-        Paragraph("TMQuality 4.0 — Informe de Control de Calidad", title),
-        Spacer(1, .35*cm),
+        Paragraph("TMQuality 4.0 - Informe de Control de Calidad", title),
+        Spacer(1, .25*cm),
         Paragraph(f"<b>Analito:</b> {analyte['nombre']} &nbsp;&nbsp; <b>Unidad:</b> {analyte['unidad']}", styles["BodyText"]),
         Paragraph(f"<b>Lote:</b> {lot['lote']} &nbsp;&nbsp; <b>Nivel:</b> {lot['nivel']}", styles["BodyText"]),
-        Paragraph(f"<b>Objetivo:</b> {lot['media_objetivo']:.4f} ± {lot['de_objetivo']:.4f}", styles["BodyText"]),
+        Paragraph(f"<b>Objetivo:</b> {lot['media_objetivo']:.4f} +/- {lot['de_objetivo']:.4f}", styles["BodyText"]),
         Spacer(1, .3*cm),
     ]
+
     summary = [
         ["Indicador", "Valor"],
         ["N", str(stats.get("n", 0))],
-        ["Media observada", f"{stats['mean']:.4f}" if stats.get("mean") is not None else "—"],
-        ["DE observada", f"{stats['sd']:.4f}" if stats.get("sd") is not None else "—"],
-        ["CV%", f"{stats['cv']:.2f}%" if stats.get("cv") is not None else "—"],
-        ["Sesgo%", f"{stats['bias']:.2f}%" if stats.get("bias") is not None else "—"],
-        ["Sigma", f"{stats['sigma']:.2f}" if stats.get("sigma") is not None else "—"],
+        ["Media observada", f"{stats['mean']:.4f}" if stats.get("mean") is not None else "-"],
+        ["DE observada", f"{stats['sd']:.4f}" if stats.get("sd") is not None else "-"],
+        ["CV%", f"{stats['cv']:.2f}%" if stats.get("cv") is not None else "-"],
+        ["Sesgo%", f"{stats['bias']:.2f}%" if stats.get("bias") is not None else "-"],
+        ["Sigma", f"{stats['sigma']:.2f}" if stats.get("sigma") is not None else "-"],
     ]
     t = Table(summary, colWidths=[6*cm, 5*cm])
     t.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#8E1B2D")),
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#14213D")),
         ("TEXTCOLOR", (0,0), (-1,0), colors.white),
         ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("GRID", (0,0), (-1,-1), .3, colors.grey),
+        ("GRID", (0,0), (-1,-1), .3, colors.HexColor("#DDE3EC")),
         ("PADDING", (0,0), (-1,-1), 6),
+        ("BACKGROUND", (0,1), (-1,-1), colors.white),
+        ("TEXTCOLOR", (0,1), (-1,-1), colors.HexColor("#14213D")),
     ]))
     story.extend([t, Spacer(1, .4*cm)])
 
+    # ------------------------------------------------------------------
+    # Gráfico Levey-Jennings incluido en el informe PDF
+    # ------------------------------------------------------------------
+    story.append(Paragraph("Levey-Jennings del lote", section))
+    chart_buffer = levey_jennings_pdf_image(
+        results,
+        float(lot["media_objetivo"]),
+        float(lot["de_objetivo"]),
+        str(analyte["unidad"]),
+    )
+    chart = Image(chart_buffer, width=17.2*cm, height=7.4*cm)
+    story.extend([chart, Spacer(1, .45*cm)])
+
     if not results.empty:
+        story.append(Paragraph("Resultados incluidos", section))
         cols = ["fecha", "turno", "operador", "valor", "estado", "reglas_violadas"]
         data = [["Fecha","Turno","Operador","Valor","Estado","Reglas"]]
         for _, r in results.tail(40).iterrows():
             data.append([str(r.get(c, ""))[:28] for c in cols])
-        rt = Table(data, repeatRows=1, colWidths=[2.1*cm,1.7*cm,3.2*cm,2*cm,2.2*cm,4*cm])
+        rt = Table(
+            data,
+            repeatRows=1,
+            colWidths=[2.1*cm,1.7*cm,3.2*cm,2*cm,2.2*cm,4*cm],
+        )
         rt.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#EDEFF2")),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#EAF0F8")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor("#14213D")),
             ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("GRID", (0,0), (-1,-1), .25, colors.lightgrey),
+            ("GRID", (0,0), (-1,-1), .25, colors.HexColor("#DDE3EC")),
             ("FONTSIZE", (0,0), (-1,-1), 7),
             ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("BACKGROUND", (0,1), (-1,-1), colors.white),
         ]))
         story.append(rt)
+
     story.append(Spacer(1, .3*cm))
     story.append(Paragraph(f"Generado: {datetime.now():%d-%m-%Y %H:%M}", styles["BodyText"]))
     doc.build(story)
@@ -1283,6 +1471,41 @@ def module_history(conn, user, analyte, lot, results):
     if not lot or results.empty:
         st.info("No hay resultados registrados para este lote.")
         return
+
+    # Herramienta de consistencia del lote.
+    tool_left, tool_right = st.columns([3, 1])
+    with tool_left:
+        st.caption(
+            "Si agregaste, corregiste o eliminaste resultados, recalcula el lote "
+            "para volver a evaluar cronológicamente todas las reglas de Westgard."
+        )
+    with tool_right:
+        if st.button(
+            "↻ Recalcular lote",
+            key=f"recalc_lot_{int(lot['id'])}",
+            use_container_width=True,
+            help="Recalcula z-score, reglas violadas y estado de todos los resultados del lote.",
+        ):
+            try:
+                n_actualizados = recalcular_reglas_lote(
+                    conn,
+                    int(lot["id"]),
+                    float(lot["media_objetivo"]),
+                    float(lot["de_objetivo"]),
+                )
+                audit(
+                    conn,
+                    "LOTE_RECALCULADO",
+                    "resultados_cc",
+                    int(lot["id"]),
+                    f"Reevaluación cronológica de {n_actualizados} resultado(s)",
+                )
+                st.success(f"Se recalcularon {n_actualizados} resultado(s) del lote.")
+                st.rerun()
+            except Exception as exc:
+                conn.rollback()
+                st.error(f"No fue posible recalcular el lote: {exc}")
+
     df = results.sort_values(["fecha","hora"], ascending=False).copy()
     state_filter = st.multiselect("Estado", ESTADOS, default=[])
     if state_filter:
