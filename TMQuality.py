@@ -368,6 +368,126 @@ div[data-baseweb="select"] > div:focus-within {
     color:var(--tmq-text) !important;
 }
 
+
+/* ==========================================================================
+   TMQuality 4.0.4 — FORZADO DE TEMA CLARO EN CONTROLES NATIVOS DE STREAMLIT
+   Streamlit puede conservar internamente el tema Dark aunque el layout de
+   TMQuality sea claro. Estos selectores actúan directamente sobre combobox,
+   inputs y controles BaseWeb para evitar superficies negras.
+   ========================================================================== */
+
+/* SELECTBOX — cubrir wrapper, combobox y TODOS los contenedores internos */
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"],
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"] div[role="combobox"],
+.stApp [data-testid="stSelectbox"] [role="combobox"],
+.stApp [data-testid="stMultiSelect"] [data-baseweb="select"],
+.stApp [data-testid="stMultiSelect"] [data-baseweb="select"] > div,
+.stApp [data-testid="stMultiSelect"] [role="combobox"] {
+    background-color:#FFFFFF !important;
+    background:#FFFFFF !important;
+    color:#14213D !important;
+    -webkit-text-fill-color:#14213D !important;
+    border-color:#DDE3EC !important;
+}
+
+/* BaseWeb introduce varios div intermedios con background del tema */
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"] > div > div,
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"] > div > div > div,
+.stApp [data-testid="stMultiSelect"] [data-baseweb="select"] > div > div,
+.stApp [data-testid="stMultiSelect"] [data-baseweb="select"] > div > div > div {
+    background-color:#FFFFFF !important;
+    background:#FFFFFF !important;
+    color:#14213D !important;
+    -webkit-text-fill-color:#14213D !important;
+}
+
+/* Texto seleccionado y placeholder */
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"] span,
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"] p,
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"] input,
+.stApp [data-testid="stMultiSelect"] [data-baseweb="select"] span,
+.stApp [data-testid="stMultiSelect"] [data-baseweb="select"] p,
+.stApp [data-testid="stMultiSelect"] [data-baseweb="select"] input {
+    color:#14213D !important;
+    -webkit-text-fill-color:#14213D !important;
+    opacity:1 !important;
+}
+
+/* Flechas de los selectores */
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"] svg,
+.stApp [data-testid="stMultiSelect"] [data-baseweb="select"] svg {
+    color:#657189 !important;
+    fill:#657189 !important;
+}
+
+/* POPUP DEL SELECTOR */
+body [data-baseweb="popover"],
+body [data-baseweb="menu"],
+body [role="listbox"],
+body ul[role="listbox"] {
+    background:#FFFFFF !important;
+    color:#14213D !important;
+}
+body [role="option"],
+body li[role="option"] {
+    background:#FFFFFF !important;
+    color:#14213D !important;
+    -webkit-text-fill-color:#14213D !important;
+}
+body [role="option"] *,
+body li[role="option"] * {
+    color:#14213D !important;
+    -webkit-text-fill-color:#14213D !important;
+}
+body [role="option"]:hover,
+body li[role="option"]:hover,
+body [role="option"][aria-selected="true"],
+body li[role="option"][aria-selected="true"] {
+    background:#EDF4FF !important;
+    color:#1559A8 !important;
+}
+
+/* INPUTS — forzar también el contenedor exterior */
+.stApp [data-testid="stTextInput"] [data-baseweb="input"],
+.stApp [data-testid="stTextInput"] [data-baseweb="input"] > div,
+.stApp [data-testid="stNumberInput"] [data-baseweb="input"],
+.stApp [data-testid="stNumberInput"] [data-baseweb="input"] > div,
+.stApp [data-testid="stTextArea"] [data-baseweb="textarea"],
+.stApp [data-testid="stTextArea"] [data-baseweb="textarea"] > div {
+    background:#FFFFFF !important;
+    background-color:#FFFFFF !important;
+    color:#14213D !important;
+    border-color:#DDE3EC !important;
+}
+.stApp [data-testid="stTextInput"] input,
+.stApp [data-testid="stNumberInput"] input,
+.stApp [data-testid="stTextArea"] textarea {
+    background:#FFFFFF !important;
+    color:#14213D !important;
+    -webkit-text-fill-color:#14213D !important;
+}
+
+/* Sidebar: prioridad máxima sobre cualquier tema oscuro persistente */
+.stApp [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"],
+.stApp [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+.stApp [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] > div > div,
+.stApp [data-testid="stSidebar"] [data-testid="stSelectbox"] [role="combobox"] {
+    background:#FFFFFF !important;
+    background-color:#FFFFFF !important;
+    color:#14213D !important;
+    -webkit-text-fill-color:#14213D !important;
+}
+
+/* Focus accesible */
+.stApp [data-testid="stSelectbox"] [role="combobox"]:focus,
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"]:focus-within,
+.stApp [data-testid="stTextInput"] [data-baseweb="input"]:focus-within {
+    outline:none !important;
+    border-color:#1F6FEB !important;
+    box-shadow:0 0 0 3px rgba(31,111,235,.12) !important;
+}
+
 /* TMQuality 4.0.1 usa deliberadamente un único tema claro coherente. */
 </style>
 """,
