@@ -1419,7 +1419,7 @@ def module_dashboard(conn, analyte, lot, results):
                 use_container_width=True,
                 key=f"review_results_{int(lot['id'])}",
             ):
-                st.session_state.main_nav = "Resultados"
+                st.session_state.pending_nav = "Resultados"
                 st.rerun()
 
         with act2:
@@ -1457,7 +1457,7 @@ def module_dashboard(conn, analyte, lot, results):
                         key=f"review_new_lot_{int(lot['id'])}",
                     ):
                         st.session_state.new_lot_analyte_id = int(analyte["id"])
-                        st.session_state.main_nav = "Lotes de control"
+                        st.session_state.pending_nav = "Lotes de control"
                         st.rerun()
                 else:
                     st.caption("Solicita a un Administrador la creación de un nuevo lote.")
@@ -2018,8 +2018,17 @@ with st.sidebar:
         nav.append("Administración")
 
     # Mantener una navegación controlable desde botones de acción.
+    # Streamlit no permite modificar la clave de un widget después de haberlo
+    # instanciado en el mismo rerun. Por eso las acciones guardan "pending_nav"
+    # y aquí se aplica ANTES de crear el radio.
+    if "pending_nav" in st.session_state:
+        requested_page = st.session_state.pop("pending_nav")
+        if requested_page in nav:
+            st.session_state["main_nav"] = requested_page
+
     if "main_nav" not in st.session_state or st.session_state.main_nav not in nav:
-        st.session_state.main_nav = "Inicio"
+        st.session_state["main_nav"] = "Inicio"
+
     page = st.radio("Navegación", nav, label_visibility="collapsed", key="main_nav")
     st.divider()
     analyte, lot, results = selected_context_ui(conn)
