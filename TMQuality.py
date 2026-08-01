@@ -956,6 +956,41 @@ def aplicar_estilos():
         .tm-muted-card { background:#F7F9FA; color:#5F6B73; border-color:#E3E8EB; }
         .tm-mini-title { color: var(--tm-muted); font-size: .82rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
         .tm-mini-value { color: var(--tm-text); font-size: 1.12rem; font-weight: 750; margin-top: .2rem; }
+
+        .tm-kpi-card {
+            display: flex;
+            align-items: center;
+            gap: .85rem;
+            background: var(--tm-surface);
+            border: 1px solid var(--tm-border);
+            border-left: 5px solid var(--tm-muted);
+            border-radius: 16px;
+            padding: .95rem 1.1rem;
+            box-shadow: 0 7px 22px rgba(32,43,53,.06);
+            transition: transform .15s ease, box-shadow .15s ease;
+        }
+        .tm-kpi-card:hover { transform: translateY(-2px); box-shadow: 0 10px 26px rgba(32,43,53,.09); }
+        .tm-kpi-icon {
+            font-size: 1.6rem;
+            width: 46px; height: 46px;
+            display: flex; align-items: center; justify-content: center;
+            border-radius: 12px;
+            flex-shrink: 0;
+        }
+        .tm-kpi-text { line-height: 1.15; }
+        .tm-kpi-value { font-size: 1.55rem; font-weight: 800; color: var(--tm-text); }
+        .tm-kpi-label { font-size: .8rem; color: var(--tm-muted); font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
+
+        .tm-kpi-neutral { border-left-color: var(--tm-primary); }
+        .tm-kpi-neutral .tm-kpi-icon { background: var(--tm-soft); }
+        .tm-kpi-ok { border-left-color: var(--tm-success); }
+        .tm-kpi-ok .tm-kpi-icon { background: #EDF8F3; }
+        .tm-kpi-warn { border-left-color: var(--tm-warning); }
+        .tm-kpi-warn .tm-kpi-icon { background: #FFF7E8; }
+        .tm-kpi-bad { border-left-color: var(--tm-danger); }
+        .tm-kpi-bad .tm-kpi-icon { background: #FFF0EE; }
+        .tm-kpi-value, .tm-kpi-label { color: var(--tm-text) !important; opacity: 1 !important; }
+        .tm-kpi-label { color: var(--tm-muted) !important; }
         div[data-baseweb="tab-list"] { gap: .4rem; }
         button[data-baseweb="tab"] {
             border-radius: 10px;
@@ -1235,13 +1270,72 @@ conformidad = (n_aceptados / n_total * 100) if n_total else 0
 ultimo_valor = float(resultados_df.iloc[-1]["valor"]) if n_total else None
 ultimo_z = ((ultimo_valor - media) / de) if ultimo_valor is not None and de else None
 
-# Indicadores rápidos
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Resultados", n_total)
-m2.metric("Aceptados", n_aceptados, delta=f"{conformidad:.1f}% conformidad" if n_total else None)
-m3.metric("Advertencias", n_advertencias)
-m4.metric("Rechazados", n_rechazados)
-m5.metric("Último z-score", f"{ultimo_z:+.2f}" if ultimo_z is not None else "—")
+# Indicadores rápidos: tarjetas KPI con color + medidor de conformidad
+def _kpi_card(icono, valor, etiqueta, clase):
+    st.markdown(
+        f"""
+        <div class="tm-kpi-card {clase}">
+            <div class="tm-kpi-icon">{icono}</div>
+            <div class="tm-kpi-text">
+                <div class="tm-kpi-value">{valor}</div>
+                <div class="tm-kpi-label">{etiqueta}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+col_kpis, col_gauge = st.columns([2.6, 1])
+with col_kpis:
+    fila1a, fila1b = st.columns(2)
+    fila2a, fila2b = st.columns(2)
+    with fila1a:
+        _kpi_card("🧪", n_total, "Resultados", "tm-kpi-neutral")
+    with fila1b:
+        _kpi_card("✅", n_aceptados, "Aceptados", "tm-kpi-ok")
+    with fila2a:
+        _kpi_card("⚠️", n_advertencias, "Advertencias", "tm-kpi-warn" if n_advertencias else "tm-kpi-neutral")
+    with fila2b:
+        _kpi_card("⛔", n_rechazados, "Rechazados", "tm-kpi-bad" if n_rechazados else "tm-kpi-neutral")
+
+with col_gauge:
+    if n_total:
+        if conformidad >= 95:
+            color_gauge = "#21845A"
+        elif conformidad >= 80:
+            color_gauge = "#C77A16"
+        else:
+            color_gauge = "#C0392B"
+
+        fig_gauge = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=conformidad,
+            number={"suffix": "%", "font": {"size": 34, "color": "#24313A"}},
+            gauge={
+                "axis": {"range": [0, 100], "tickcolor": "#97A3AA", "tickfont": {"color": "#697780"}},
+                "bar": {"color": color_gauge, "thickness": 0.28},
+                "bgcolor": "white",
+                "borderwidth": 0,
+                "steps": [
+                    {"range": [0, 80], "color": "#FFF0EE"},
+                    {"range": [80, 95], "color": "#FFF7E8"},
+                    {"range": [95, 100], "color": "#EDF8F3"},
+                ],
+            },
+        ))
+        fig_gauge.update_layout(
+            height=190, margin=dict(l=15, r=15, t=15, b=5),
+            paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(family="Arial, sans-serif"),
+        )
+        st.plotly_chart(fig_gauge, use_container_width=True, config={"displayModeBar": False})
+        st.markdown(
+            f"<p style='text-align:center; color:var(--tm-muted); margin-top:-0.6rem; font-size:.85rem;'>"
+            f"Conformidad del lote · último z-score {ultimo_z:+.2f}</p>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("Sin datos aún para calcular conformidad.")
 
 if n_total:
     ultimo_estado = resultados_df.iloc[-1]["estado"]
