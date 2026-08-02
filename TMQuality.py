@@ -768,6 +768,133 @@ button[data-baseweb="tab"][aria-selected="true"] {
     background: #FFFFFF !important;
 }
 
+
+/* ==========================================================================
+   TMQuality 5.2.1 — Sistema consistente de botones
+   ========================================================================== */
+
+/* Base común */
+.stApp div.stButton > button,
+.stApp div.stDownloadButton > button,
+.stApp div.stFormSubmitButton > button {
+    min-height: 44px !important;
+    padding: 0.68rem 1.05rem !important;
+    border-radius: 11px !important;
+    font-size: 0.94rem !important;
+    font-weight: 750 !important;
+    letter-spacing: 0 !important;
+    transition: all .16s ease !important;
+    box-shadow: none !important;
+}
+
+/* Forzar SIEMPRE el color del texto y elementos internos */
+.stApp div.stButton > button *,
+.stApp div.stDownloadButton > button *,
+.stApp div.stFormSubmitButton > button * {
+    color: inherit !important;
+    -webkit-text-fill-color: currentColor !important;
+}
+
+/* Botón primario */
+.stApp button[kind="primary"],
+.stApp div.stButton > button[kind="primary"],
+.stApp div.stFormSubmitButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #F43F6B 0%, #E92E5F 100%) !important;
+    color: #FFFFFF !important;
+    border: 1px solid #E92E5F !important;
+    box-shadow: 0 5px 14px rgba(244, 63, 107, .18) !important;
+}
+.stApp button[kind="primary"]:hover:not(:disabled),
+.stApp div.stButton > button[kind="primary"]:hover:not(:disabled),
+.stApp div.stFormSubmitButton > button[kind="primary"]:hover:not(:disabled) {
+    background: linear-gradient(135deg, #E92E5F 0%, #D92556 100%) !important;
+    color: #FFFFFF !important;
+    border-color: #D92556 !important;
+    transform: translateY(-1px) !important;
+    box-shadow: 0 7px 18px rgba(244, 63, 107, .24) !important;
+}
+
+/* Secundario / acciones normales */
+.stApp div.stButton > button:not([kind="primary"]),
+.stApp div.stDownloadButton > button {
+    background: #FFFFFF !important;
+    color: #26344D !important;
+    border: 1px solid #D8E0EB !important;
+    box-shadow: 0 2px 7px rgba(27, 42, 70, .035) !important;
+}
+.stApp div.stButton > button:not([kind="primary"]):hover:not(:disabled),
+.stApp div.stDownloadButton > button:hover:not(:disabled) {
+    background: #FFF4F7 !important;
+    color: #D92D59 !important;
+    border-color: #F1A8BA !important;
+    transform: translateY(-1px) !important;
+}
+
+/* Botón deshabilitado */
+.stApp button:disabled,
+.stApp div.stButton > button:disabled,
+.stApp div.stDownloadButton > button:disabled,
+.stApp div.stFormSubmitButton > button:disabled {
+    background: #F2F4F7 !important;
+    color: #98A2B3 !important;
+    border: 1px solid #E4E7EC !important;
+    box-shadow: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+}
+
+/* Evitar texto rosado dentro de botones rojos */
+.stApp button[kind="primary"] p,
+.stApp button[kind="primary"] span,
+.stApp button[kind="primary"] div,
+.stApp div.stFormSubmitButton > button[kind="primary"] p,
+.stApp div.stFormSubmitButton > button[kind="primary"] span,
+.stApp div.stFormSubmitButton > button[kind="primary"] div {
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+}
+
+/* Tamaños y alineación */
+.stApp div.stButton > button p,
+.stApp div.stDownloadButton > button p,
+.stApp div.stFormSubmitButton > button p {
+    margin: 0 !important;
+    line-height: 1.15 !important;
+    font-weight: inherit !important;
+}
+
+/* Botones dentro de columnas: ocupación elegante */
+.stApp [data-testid="column"] div.stButton > button,
+.stApp [data-testid="column"] div.stDownloadButton > button {
+    width: 100% !important;
+}
+
+/* Evitar aspecto excesivamente alto en botones de acción corta */
+.stApp div.stButton > button[data-testid="baseButton-secondary"],
+.stApp div.stButton > button[data-testid="baseButton-primary"] {
+    min-height: 42px !important;
+}
+
+/* Acción peligrosa mediante texto reconocido */
+.stApp div.stButton > button:has(p:is(
+    :where(:not(:empty))
+)) {
+    text-decoration: none !important;
+}
+
+/* Botones en paneles y formularios */
+[data-testid="stForm"] .stFormSubmitButton > button {
+    margin-top: .3rem !important;
+}
+
+/* Foco accesible */
+.stApp div.stButton > button:focus-visible,
+.stApp div.stDownloadButton > button:focus-visible,
+.stApp div.stFormSubmitButton > button:focus-visible {
+    outline: none !important;
+    box-shadow: 0 0 0 3px rgba(244,63,107,.16) !important;
+}
+
 </style>
 """,
     unsafe_allow_html=True,
