@@ -4,3 +4,4 @@ pandas
 matplotlib
 reportlab
 psycopg2-binary
+XlsxWriter
