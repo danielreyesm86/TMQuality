@@ -10,6 +10,10 @@ import pandas as pd
 import streamlit as st
 from database import execute, fetchone, fetchall_df, current_org_id
 
+# Parámetros propios del motor de autenticación.
+PBKDF2_ITERATIONS = 260_000
+LEGACY_PBKDF2_ITERATIONS = 100_000
+
 def hash_password(password: str, salt_hex: Optional[str] = None, iterations: int = PBKDF2_ITERATIONS) -> tuple[str, str]:
     """Genera PBKDF2-SHA256.
 
