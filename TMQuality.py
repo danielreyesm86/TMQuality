@@ -74,7 +74,7 @@ LOGO_ICON_B64 = _asset_b64("tmquality_logo_icon.png")
 
 
 
-APP_VERSION = "5.4.0"
+APP_VERSION = "5.4.1"
 PBKDF2_ITERATIONS = 260_000
 LEGACY_PBKDF2_ITERATIONS = 100_000
 ROLES = ["Administrador", "Supervisor", "Operador"]
@@ -3226,34 +3226,124 @@ def generate_excel_report(analyte: dict, lot: dict, results: pd.DataFrame, stats
     return output.getvalue()
 
 
-def delete_lot_permanently(conn, lot_id: int, user: dict) -> None:
+def archive_lot(conn, lot_id: int, user: dict) -> None:
+    """Archiva un lote sin eliminar resultados ni trazabilidad."""
     row = fetchone(
         conn,
-        """SELECT l.id,l.lote,l.nivel,a.nombre AS analito,
+        """SELECT l.id,l.lote,l.nivel,l.vigente,a.nombre AS analito,
                   (SELECT COUNT(*) FROM resultados_cc r WHERE r.lote_control_id=l.id) AS resultados
-           FROM lotes_control l JOIN analitos a ON a.id=l.analito_id
+           FROM lotes_control l
+           JOIN analitos a ON a.id=l.analito_id
            WHERE l.id=%s AND l.organizacion_id=%s""",
         (lot_id, current_org_id(user)),
     )
     if not row:
         raise ValueError("El lote no existe o no pertenece a tu organización.")
-    execute(conn, "DELETE FROM lotes_control WHERE id=%s AND organizacion_id=%s", (lot_id, current_org_id(user)))
-    audit(conn, "LOTE_ELIMINADO", "lotes_control", lot_id, f"{row['analito']} · {row['nivel']} · {row['lote']} · {row['resultados']} resultado(s) eliminados")
+    execute(
+        conn,
+        "UPDATE lotes_control SET vigente=FALSE WHERE id=%s AND organizacion_id=%s",
+        (lot_id, current_org_id(user)),
+    )
+    audit(
+        conn,
+        "LOTE_ARCHIVADO",
+        "lotes_control",
+        lot_id,
+        f"{row['analito']} · {row['nivel']} · {row['lote']} · {row['resultados']} resultado(s) conservados",
+    )
 
 
-def delete_analyte_permanently(conn, analyte_id: int, user: dict) -> None:
+def restore_lot(conn, lot_id: int, user: dict) -> None:
+    """Restaura un lote archivado."""
     row = fetchone(
         conn,
-        """SELECT a.id,a.nombre,
+        """SELECT l.id,l.lote,l.nivel,a.nombre AS analito
+           FROM lotes_control l
+           JOIN analitos a ON a.id=l.analito_id
+           WHERE l.id=%s AND l.organizacion_id=%s""",
+        (lot_id, current_org_id(user)),
+    )
+    if not row:
+        raise ValueError("El lote no existe o no pertenece a tu organización.")
+    execute(
+        conn,
+        "UPDATE lotes_control SET vigente=TRUE WHERE id=%s AND organizacion_id=%s",
+        (lot_id, current_org_id(user)),
+    )
+    audit(
+        conn,
+        "LOTE_RESTAURADO",
+        "lotes_control",
+        lot_id,
+        f"{row['analito']} · {row['nivel']} · {row['lote']}",
+    )
+
+
+def archive_analyte(conn, analyte_id: int, user: dict) -> None:
+    """Archiva un analito y sus lotes sin borrar ningún dato histórico."""
+    row = fetchone(
+        conn,
+        """SELECT a.id,a.nombre,a.activo,
                   (SELECT COUNT(*) FROM lotes_control l WHERE l.analito_id=a.id) AS lotes,
-                  (SELECT COUNT(*) FROM resultados_cc r JOIN lotes_control l ON l.id=r.lote_control_id WHERE l.analito_id=a.id) AS resultados
-           FROM analitos a WHERE a.id=%s AND a.organizacion_id=%s""",
+                  (SELECT COUNT(*) FROM resultados_cc r
+                   JOIN lotes_control l ON l.id=r.lote_control_id
+                   WHERE l.analito_id=a.id) AS resultados
+           FROM analitos a
+           WHERE a.id=%s AND a.organizacion_id=%s""",
         (analyte_id, current_org_id(user)),
     )
     if not row:
         raise ValueError("El analito no existe o no pertenece a tu organización.")
-    execute(conn, "DELETE FROM analitos WHERE id=%s AND organizacion_id=%s", (analyte_id, current_org_id(user)))
-    audit(conn, "ANALITO_ELIMINADO", "analitos", analyte_id, f"{row['nombre']} · {row['lotes']} lote(s) · {row['resultados']} resultado(s) eliminados")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE analitos SET activo=FALSE WHERE id=%s AND organizacion_id=%s",
+            (analyte_id, current_org_id(user)),
+        )
+        cur.execute(
+            "UPDATE lotes_control SET vigente=FALSE WHERE analito_id=%s AND organizacion_id=%s",
+            (analyte_id, current_org_id(user)),
+        )
+    conn.commit()
+
+    audit(
+        conn,
+        "ANALITO_ARCHIVADO",
+        "analitos",
+        analyte_id,
+        f"{row['nombre']} · {row['lotes']} lote(s) · {row['resultados']} resultado(s) conservados",
+    )
+
+
+def restore_analyte(conn, analyte_id: int, user: dict, restore_lots: bool = False) -> None:
+    """Restaura un analito archivado. Opcionalmente reactiva sus lotes."""
+    row = fetchone(
+        conn,
+        "SELECT id,nombre FROM analitos WHERE id=%s AND organizacion_id=%s",
+        (analyte_id, current_org_id(user)),
+    )
+    if not row:
+        raise ValueError("El analito no existe o no pertenece a tu organización.")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE analitos SET activo=TRUE WHERE id=%s AND organizacion_id=%s",
+            (analyte_id, current_org_id(user)),
+        )
+        if restore_lots:
+            cur.execute(
+                "UPDATE lotes_control SET vigente=TRUE WHERE analito_id=%s AND organizacion_id=%s",
+                (analyte_id, current_org_id(user)),
+            )
+    conn.commit()
+
+    audit(
+        conn,
+        "ANALITO_RESTAURADO",
+        "analitos",
+        analyte_id,
+        f"{row['nombre']} · lotes {'reactivados' if restore_lots else 'conservados archivados'}",
+    )
 
 
 def module_reports(conn, analyte, lot, results):
@@ -3346,7 +3436,7 @@ def module_audit(conn):
 
 def module_lots(conn, user):
     st.subheader("Lotes de control")
-    st.caption("Gestiona límites, vigencia y eliminación de lotes de material de control.")
+    st.caption("Gestiona límites, vigencia y archivado seguro de lotes de material de control.")
 
     analytes_all = load_analytes(conn)
     if analytes_all.empty:
@@ -3381,7 +3471,7 @@ def module_lots(conn, user):
         )
 
     if user["rol"] != "Administrador":
-        st.info("La creación y eliminación de lotes está disponible para Administradores.")
+        st.info("La creación, archivado y restauración de lotes está disponible para Administradores.")
         return
 
     st.divider()
@@ -3449,21 +3539,27 @@ def module_lots(conn, user):
         row=lots_df[lots_df.id==lot_id].iloc[0]
         c1,c2=st.columns(2)
         with c1:
-            action="Desactivar lote" if bool(row.vigente) else "Reactivar lote"
-            if st.button(action,use_container_width=True):
-                new_state=not bool(row.vigente)
-                execute(conn,"UPDATE lotes_control SET vigente=%s WHERE id=%s AND organizacion_id=%s",(new_state,lot_id,current_org_id(user)))
-                audit(conn,"LOTE_REACTIVADO" if new_state else "LOTE_DESACTIVADO","lotes_control",lot_id,label)
-                st.rerun()
+            if bool(row.vigente):
+                if st.button("Archivar lote", use_container_width=True, key=f"archive_lot_{lot_id}"):
+                    try:
+                        archive_lot(conn, lot_id, user)
+                        st.success("Lote archivado. Sus resultados permanecen intactos.")
+                        st.rerun()
+                    except Exception as exc:
+                        conn.rollback(); st.error(str(exc))
+            else:
+                if st.button("Restaurar lote", use_container_width=True, key=f"restore_lot_{lot_id}"):
+                    try:
+                        restore_lot(conn, lot_id, user)
+                        st.success("Lote restaurado.")
+                        st.rerun()
+                    except Exception as exc:
+                        conn.rollback(); st.error(str(exc))
         with c2:
-            confirm=st.checkbox(f"Confirmo eliminar permanentemente {label}",key=f"confirm_delete_lot_{lot_id}")
-            if st.button("Eliminar lote y sus resultados",use_container_width=True,disabled=not confirm):
-                try:
-                    delete_lot_permanently(conn,lot_id,user)
-                    st.success("Lote eliminado permanentemente.")
-                    st.rerun()
-                except Exception as exc:
-                    conn.rollback(); st.error(str(exc))
+            if bool(row.vigente):
+                st.info(f"Archivar conserva los {int(row.resultados)} resultado(s) del lote.")
+            else:
+                st.caption("Este lote está archivado y puede restaurarse en cualquier momento.")
 
 def module_admin(conn, user):
     st.subheader("Administración")
@@ -3571,25 +3667,62 @@ def module_admin(conn, user):
                 conn.rollback(); st.error("El analito ya existe.")
 
         if not analytes.empty:
-            st.markdown("##### Eliminar analito")
-            a_options = {f"{r.nombre} ({r.unidad})": int(r.id) for r in analytes.itertuples()}
-            a_label = st.selectbox("Analito a eliminar", list(a_options.keys()), key="delete_analyte_select")
+            st.markdown("##### Archivar o restaurar analito")
+            a_options = {
+                f"{r.nombre} ({r.unidad}) · {'Activo' if bool(r.activo) else 'Archivado'}": int(r.id)
+                for r in analytes.itertuples()
+            }
+            a_label = st.selectbox("Analito", list(a_options.keys()), key="manage_analyte_select")
             a_id = a_options[a_label]
+            selected_analyte = analytes[analytes["id"] == a_id].iloc[0]
             counts = fetchone(
                 conn,
-                """SELECT (SELECT COUNT(*) FROM lotes_control WHERE analito_id=%s) AS lotes,
-                           (SELECT COUNT(*) FROM resultados_cc r JOIN lotes_control l ON l.id=r.lote_control_id WHERE l.analito_id=%s) AS resultados""",
+                """SELECT
+                       (SELECT COUNT(*) FROM lotes_control WHERE analito_id=%s) AS lotes,
+                       (SELECT COUNT(*) FROM resultados_cc r
+                        JOIN lotes_control l ON l.id=r.lote_control_id
+                        WHERE l.analito_id=%s) AS resultados""",
                 (a_id, a_id),
             )
-            st.warning(f"Esta acción eliminará {counts['lotes']} lote(s) y {counts['resultados']} resultado(s) asociados.")
-            confirmation = st.text_input("Escribe ELIMINAR para confirmar", key="delete_analyte_confirmation")
-            if st.button("Eliminar analito permanentemente", disabled=confirmation.strip().upper() != "ELIMINAR", use_container_width=True):
-                try:
-                    delete_analyte_permanently(conn, a_id, user)
-                    st.success("Analito eliminado permanentemente.")
-                    st.rerun()
-                except Exception as exc:
-                    conn.rollback(); st.error(str(exc))
+
+            if bool(selected_analyte["activo"]):
+                st.info(
+                    f"Archivar este analito conservará sus {counts['lotes']} lote(s) "
+                    f"y {counts['resultados']} resultado(s)."
+                )
+                confirm_archive = st.checkbox(
+                    "Confirmo archivar este analito",
+                    key=f"confirm_archive_analyte_{a_id}",
+                )
+                if st.button(
+                    "Archivar analito",
+                    disabled=not confirm_archive,
+                    use_container_width=True,
+                    key=f"archive_analyte_{a_id}",
+                ):
+                    try:
+                        archive_analyte(conn, a_id, user)
+                        st.success("Analito archivado. No se eliminó ningún dato.")
+                        st.rerun()
+                    except Exception as exc:
+                        conn.rollback(); st.error(str(exc))
+            else:
+                restore_lots_too = st.checkbox(
+                    "Restaurar también todos sus lotes",
+                    value=False,
+                    key=f"restore_analyte_lots_{a_id}",
+                )
+                if st.button(
+                    "Restaurar analito",
+                    use_container_width=True,
+                    key=f"restore_analyte_{a_id}",
+                ):
+                    try:
+                        restore_analyte(conn, a_id, user, restore_lots=restore_lots_too)
+                        st.success("Analito restaurado.")
+                        st.rerun()
+                    except Exception as exc:
+                        conn.rollback(); st.error(str(exc))
     with tab_l:
         analytes = load_analytes(conn)
         if analytes.empty:
