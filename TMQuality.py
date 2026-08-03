@@ -74,7 +74,7 @@ LOGO_ICON_B64 = _asset_b64("tmquality_logo_icon.png")
 
 
 
-APP_VERSION = "5.4.1"
+APP_VERSION = "5.5.0"
 PBKDF2_ITERATIONS = 260_000
 LEGACY_PBKDF2_ITERATIONS = 100_000
 ROLES = ["Administrador", "Supervisor", "Operador"]
@@ -1596,6 +1596,7 @@ def init_db(conn):
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_equipos_org_serie ON equipos(organizacion_id, numero_serie) WHERE numero_serie IS NOT NULL AND numero_serie <> ''",
         "CREATE INDEX IF NOT EXISTS idx_lotes_analito ON lotes_control(analito_id)",
         "CREATE INDEX IF NOT EXISTS idx_resultados_lote_fecha ON resultados_cc(lote_control_id, fecha)",
+        "CREATE INDEX IF NOT EXISTS idx_resultados_org_lote_fecha ON resultados_cc(organizacion_id, lote_control_id, fecha)",
         "CREATE INDEX IF NOT EXISTS idx_resultados_equipo ON resultados_cc(equipo_id)",
         "CREATE INDEX IF NOT EXISTS idx_auditoria_fecha ON auditoria(fecha_hora DESC)",
         "CREATE INDEX IF NOT EXISTS idx_auditoria_usuario ON auditoria(usuario_id)",
@@ -2307,6 +2308,95 @@ def load_results(conn, lot_id: int, limit: Optional[int] = None):
     return fetchall_df(conn, sql, (org_id, lot_id))
 
 
+def load_results_between(conn, lot_id: int, start_date: date, end_date: date):
+    """Carga únicamente los resultados necesarios para un período."""
+    org_id = current_org_id()
+    if org_id is None:
+        return pd.DataFrame()
+    return fetchall_df(
+        conn,
+        """
+        SELECT r.*, e.nombre AS equipo_nombre, u.nombre_completo AS usuario_nombre
+        FROM resultados_cc r
+        LEFT JOIN equipos e ON e.id=r.equipo_id AND e.organizacion_id=r.organizacion_id
+        LEFT JOIN usuarios u ON u.id=r.usuario_id AND u.organizacion_id=r.organizacion_id
+        WHERE r.organizacion_id=%s
+          AND r.lote_control_id=%s
+          AND r.fecha BETWEEN %s AND %s
+        ORDER BY r.fecha ASC, r.hora ASC, r.id ASC
+        """,
+        (org_id, int(lot_id), start_date, end_date),
+    )
+
+
+def result_date_bounds(conn, lot_id: int) -> tuple[date, date]:
+    """Obtiene solo las fechas mínima y máxima, sin descargar el historial."""
+    org_id = current_org_id()
+    if org_id is None:
+        today = date.today()
+        return today, today
+    row = fetchone(
+        conn,
+        """
+        SELECT MIN(fecha) AS min_fecha, MAX(fecha) AS max_fecha
+        FROM resultados_cc
+        WHERE organizacion_id=%s AND lote_control_id=%s
+        """,
+        (org_id, int(lot_id)),
+    )
+    today = date.today()
+    if not row or not row.get("min_fecha"):
+        return today, today
+    return row["min_fecha"], row["max_fecha"]
+
+
+def result_summary(conn, lot_id: int, target_mean: float, allowable_error: Optional[float]) -> dict:
+    """Resumen estadístico calculado en PostgreSQL para no transferir todo el lote."""
+    org_id = current_org_id()
+    if org_id is None:
+        return {
+            "n": 0, "accepted": 0, "warnings": 0, "rejected": 0,
+            "mean": None, "sd": None, "cv": None, "bias": None, "sigma": None,
+        }
+
+    row = fetchone(
+        conn,
+        """
+        SELECT
+            COUNT(*) AS n,
+            COUNT(*) FILTER (WHERE estado='Aceptado') AS accepted,
+            COUNT(*) FILTER (WHERE estado='Advertencia') AS warnings,
+            COUNT(*) FILTER (WHERE estado='Rechazado') AS rejected,
+            AVG(valor) AS mean,
+            STDDEV_SAMP(valor) AS sd
+        FROM resultados_cc
+        WHERE organizacion_id=%s AND lote_control_id=%s
+        """,
+        (org_id, int(lot_id)),
+    ) or {}
+
+    n = int(row.get("n") or 0)
+    mean = float(row["mean"]) if row.get("mean") is not None else None
+    sd = float(row["sd"]) if row.get("sd") is not None else None
+    cv = (sd / mean * 100) if sd is not None and mean not in (None, 0) else None
+    bias = ((mean - target_mean) / target_mean * 100) if mean is not None and target_mean else None
+    sigma = None
+    if allowable_error is not None and cv not in (None, 0) and bias is not None:
+        sigma = (float(allowable_error) - abs(bias)) / cv
+
+    return {
+        "n": n,
+        "accepted": int(row.get("accepted") or 0),
+        "warnings": int(row.get("warnings") or 0),
+        "rejected": int(row.get("rejected") or 0),
+        "mean": mean,
+        "sd": sd,
+        "cv": cv,
+        "bias": bias,
+        "sigma": sigma,
+    }
+
+
 def list_users(conn):
     org_id = current_org_id()
     if org_id is None:
@@ -2756,7 +2846,7 @@ def kpi(label: str, value: str, hint: str = "", tone: str = "info"):
     st.markdown(f"""<div class="tmq-kpi {tone}"><div class="label">{label}</div><div class="value">{value}</div><div class="hint">{hint}</div></div>""", unsafe_allow_html=True)
 
 
-def selected_context_ui(conn, *, include_results: bool = True):
+def selected_context_ui(conn, *, include_results: bool = True, result_limit: Optional[int] = None):
     analytes = load_analytes(conn)
     if analytes.empty:
         return None, None, None
@@ -2778,7 +2868,7 @@ def selected_context_ui(conn, *, include_results: bool = True):
         "SELECT * FROM lotes_control WHERE id=%s AND organizacion_id=%s",
         (lot_map[l_label], current_org_id()),
     )
-    results = load_results(conn, lot["id"]) if include_results else None
+    results = load_results(conn, lot["id"], limit=result_limit) if include_results else None
     return analyte, lot, results
 
 # -----------------------------------------------------------------------------
@@ -2788,20 +2878,26 @@ def module_dashboard(conn, analyte, lot, results):
     if not analyte or not lot:
         st.info("Crea un analito y un lote para comenzar.")
         return
-    stats = qc_statistics(results, lot["media_objetivo"], analyte.get("error_total_permitido"))
-    accepted = int((results["estado"] == "Aceptado").sum()) if not results.empty else 0
-    warn = int((results["estado"] == "Advertencia").sum()) if not results.empty else 0
-    reject = int((results["estado"] == "Rechazado").sum()) if not results.empty else 0
-    conform = accepted / len(results) * 100 if len(results) else 0
-    state = "EN CONTROL" if reject == 0 and warn == 0 and len(results) else ("SIN DATOS" if not len(results) else "REVISAR LOTE")
+    stats = result_summary(
+        conn,
+        int(lot["id"]),
+        float(lot["media_objetivo"]),
+        analyte.get("error_total_permitido"),
+    )
+    total_results = int(stats["n"])
+    accepted = int(stats["accepted"])
+    warn = int(stats["warnings"])
+    reject = int(stats["rejected"])
+    conform = accepted / total_results * 100 if total_results else 0
+    state = "EN CONTROL" if reject == 0 and warn == 0 and total_results else ("SIN DATOS" if not total_results else "REVISAR LOTE")
     state_cls = "good" if state == "EN CONTROL" else ("" if state == "SIN DATOS" else "bad")
 
     st.markdown('<div class="tmq-section">Resumen del lote</div>', unsafe_allow_html=True)
     a,b,c = st.columns([1.15,1,1])
     with a:
         st.markdown(f'''<div class="tmq-status {state_cls}"><div class="eyebrow">Estado del lote</div><div class="big">{state}</div><div class="small">{analyte['nombre']} · {lot['nivel']} · {lot['lote']}</div></div>''', unsafe_allow_html=True)
-    with b: kpi("Conformidad", f"{conform:.1f}%", f"{accepted} de {len(results)} aceptados", "good" if conform >= 90 else "warn")
-    with c: kpi("Resultados", str(len(results)), f"{reject} rechazo(s) · {warn} advertencia(s)", "bad" if reject else "info")
+    with b: kpi("Conformidad", f"{conform:.1f}%", f"{accepted} de {total_results} aceptados", "good" if conform >= 90 else "warn")
+    with c: kpi("Resultados", str(total_results), f"{reject} rechazo(s) · {warn} advertencia(s)", "bad" if reject else "info")
 
     # ------------------------------------------------------------------
     # Alerta accionable cuando el lote requiere revisión
@@ -3003,6 +3099,11 @@ def module_history(conn, user, analyte, lot, results):
                 st.error(f"No fue posible recalcular el lote: {exc}")
 
     df = results.sort_values(["fecha","hora"], ascending=False).copy()
+    if len(results) >= 500:
+        st.caption(
+            "Por rendimiento se muestran hasta 500 resultados recientes en esta vista. "
+            "Los reportes por fecha consultan directamente el historial completo."
+        )
     state_filter = st.multiselect("Estado", ESTADOS, default=[])
     if state_filter:
         df = df[df["estado"].isin(state_filter)]
@@ -3346,43 +3447,61 @@ def restore_analyte(conn, analyte_id: int, user: dict, restore_lots: bool = Fals
     )
 
 
-def module_reports(conn, analyte, lot, results):
+def module_reports(conn, analyte, lot, results=None):
     st.subheader("Reportes y exportación")
     if not analyte or not lot:
         st.info("Selecciona un analito y lote.")
         return
 
-    if results.empty:
-        min_date = max_date = date.today()
-    else:
-        dates = pd.to_datetime(results["fecha"], errors="coerce").dropna()
-        min_date = dates.min().date() if not dates.empty else date.today()
-        max_date = dates.max().date() if not dates.empty else date.today()
+    min_date, max_date = result_date_bounds(conn, int(lot["id"]))
 
     st.markdown("#### Período del reporte")
     c1, c2 = st.columns(2)
     with c1:
-        start_date = st.date_input("Desde", value=min_date, key=f"report_start_{lot['id']}")
+        start_date = st.date_input(
+            "Desde",
+            value=min_date,
+            min_value=min_date,
+            max_value=max_date,
+            key=f"report_start_{lot['id']}",
+        )
     with c2:
-        end_date = st.date_input("Hasta", value=max_date, key=f"report_end_{lot['id']}")
+        end_date = st.date_input(
+            "Hasta",
+            value=max_date,
+            min_value=min_date,
+            max_value=max_date,
+            key=f"report_end_{lot['id']}",
+        )
 
     if start_date > end_date:
         st.error("La fecha inicial no puede ser posterior a la fecha final.")
         return
 
-    filtered = results.copy()
-    if not filtered.empty:
-        filtered["fecha"] = pd.to_datetime(filtered["fecha"], errors="coerce")
-        filtered = filtered[
-            (filtered["fecha"].dt.date >= start_date)
-            & (filtered["fecha"].dt.date <= end_date)
-        ].copy()
+    # Solo esta consulta trae los resultados que realmente formarán el reporte.
+    filtered = load_results_between(
+        conn,
+        int(lot["id"]),
+        start_date,
+        end_date,
+    )
 
-    st.caption(f"El reporte incluirá {len(filtered)} resultado(s) entre {start_date:%d-%m-%Y} y {end_date:%d-%m-%Y}.")
+    st.caption(
+        f"El reporte incluirá {len(filtered)} resultado(s) entre "
+        f"{start_date:%d-%m-%Y} y {end_date:%d-%m-%Y}."
+    )
+
     if filtered.empty:
-        st.warning("No existen resultados en el período seleccionado. El informe contendrá el resumen sin resultados.")
+        st.warning(
+            "No existen resultados en el período seleccionado. "
+            "El informe contendrá el resumen sin resultados."
+        )
 
-    stats = qc_statistics(filtered, lot["media_objetivo"], analyte.get("error_total_permitido"))
+    stats = qc_statistics(
+        filtered,
+        lot["media_objetivo"],
+        analyte.get("error_total_permitido"),
+    )
     period = f"{start_date:%Y%m%d}_{end_date:%Y%m%d}"
     base_name = f"TMQuality_{analyte['nombre']}_{lot['lote']}_{period}".replace(" ", "_")
 
@@ -3397,7 +3516,14 @@ def module_reports(conn, analyte, lot, results):
             use_container_width=True,
         )
     with c2:
-        excel = generate_excel_report(analyte, lot, filtered, stats, start_date, end_date)
+        excel = generate_excel_report(
+            analyte,
+            lot,
+            filtered,
+            stats,
+            start_date,
+            end_date,
+        )
         st.download_button(
             "📊 Descargar informe Excel",
             excel,
@@ -3408,8 +3534,22 @@ def module_reports(conn, analyte, lot, results):
 
     if not filtered.empty:
         st.markdown("#### Vista previa")
-        preview_cols = [c for c in ["fecha", "turno", "operador", "valor", "z_score", "estado", "reglas_violadas"] if c in filtered.columns]
-        st.dataframe(filtered[preview_cols], use_container_width=True, hide_index=True)
+        preview_cols = [
+            c for c in
+            ["fecha", "turno", "operador", "valor", "z_score", "estado", "reglas_violadas"]
+            if c in filtered.columns
+        ]
+        st.dataframe(
+            filtered[preview_cols].tail(500),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if len(filtered) > 500:
+            st.caption(
+                "La vista previa muestra los 500 registros más recientes. "
+                "El PDF y Excel incluyen todo el período."
+            )
+
 
 def module_audit(conn):
     st.subheader("Auditoría")
@@ -3834,10 +3974,19 @@ with st.sidebar:
 
     page = st.radio("Navegación", nav, label_visibility="collapsed", key="main_nav")
     st.divider()
-    pages_requiring_results = {"Inicio", "Control de calidad", "Resultados", "Analítica", "Reportes"}
+    # Cada pantalla solicita solo la cantidad de resultados que necesita.
+    # Reportes hace su propia consulta por rango de fechas.
+    page_result_limits = {
+        "Inicio": 300,
+        "Control de calidad": 30,
+        "Resultados": 500,
+        "Analítica": 1500,
+    }
+    include_results = page in page_result_limits
     analyte, lot, results = selected_context_ui(
         conn,
-        include_results=page in pages_requiring_results,
+        include_results=include_results,
+        result_limit=page_result_limits.get(page),
     )
     if analyte and lot:
         st.caption("PARÁMETROS OBJETIVO")
