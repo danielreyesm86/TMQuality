@@ -74,7 +74,7 @@ LOGO_ICON_B64 = _asset_b64("tmquality_logo_icon.png")
 
 
 
-APP_VERSION = "5.6.3"
+APP_VERSION = "5.6.4"
 PBKDF2_ITERATIONS = 260_000
 LEGACY_PBKDF2_ITERATIONS = 100_000
 ROLES = ["Administrador", "Supervisor", "Operador"]
@@ -1253,6 +1253,9 @@ from database import (
     ensure_database_ready,
     current_org_id,
     current_organization,
+    load_control_levels,
+    control_level_names,
+    sync_control_levels
 )
 
 # -----------------------------------------------------------------------------
@@ -1280,8 +1283,10 @@ from services import (
     state_from_rules,
     recalcular_reglas_lote,
     qc_statistics,
-    control_levels_for,
+    parse_control_levels,
 )
+
+from modules import module_lots
 
 # -----------------------------------------------------------------------------
 # DATOS / CONSULTAS
@@ -2359,59 +2364,6 @@ def generate_excel_report(analyte: dict, lot: dict, results: pd.DataFrame, stats
     return output.getvalue()
 
 
-def archive_lot(conn, lot_id: int, user: dict) -> None:
-    """Archiva un lote sin eliminar resultados ni trazabilidad."""
-    row = fetchone(
-        conn,
-        """SELECT l.id,l.lote,l.nivel,l.vigente,a.nombre AS analito,
-                  (SELECT COUNT(*) FROM resultados_cc r WHERE r.lote_control_id=l.id) AS resultados
-           FROM lotes_control l
-           JOIN analitos a ON a.id=l.analito_id
-           WHERE l.id=%s AND l.organizacion_id=%s""",
-        (lot_id, current_org_id(user)),
-    )
-    if not row:
-        raise ValueError("El lote no existe o no pertenece a tu organización.")
-    execute(
-        conn,
-        "UPDATE lotes_control SET vigente=FALSE WHERE id=%s AND organizacion_id=%s",
-        (lot_id, current_org_id(user)),
-    )
-    audit(
-        conn,
-        "LOTE_ARCHIVADO",
-        "lotes_control",
-        lot_id,
-        f"{row['analito']} · {row['nivel']} · {row['lote']} · {row['resultados']} resultado(s) conservados",
-    )
-
-
-def restore_lot(conn, lot_id: int, user: dict) -> None:
-    """Restaura un lote archivado."""
-    row = fetchone(
-        conn,
-        """SELECT l.id,l.lote,l.nivel,a.nombre AS analito
-           FROM lotes_control l
-           JOIN analitos a ON a.id=l.analito_id
-           WHERE l.id=%s AND l.organizacion_id=%s""",
-        (lot_id, current_org_id(user)),
-    )
-    if not row:
-        raise ValueError("El lote no existe o no pertenece a tu organización.")
-    execute(
-        conn,
-        "UPDATE lotes_control SET vigente=TRUE WHERE id=%s AND organizacion_id=%s",
-        (lot_id, current_org_id(user)),
-    )
-    audit(
-        conn,
-        "LOTE_RESTAURADO",
-        "lotes_control",
-        lot_id,
-        f"{row['analito']} · {row['nivel']} · {row['lote']}",
-    )
-
-
 def archive_analyte(conn, analyte_id: int, user: dict) -> None:
     """Archiva un analito y sus lotes sin borrar ningún dato histórico."""
     row = fetchone(
@@ -2606,133 +2558,6 @@ def module_audit(conn):
 
 
 
-def module_lots(conn, user):
-    st.subheader("Lotes de control")
-    st.caption("Gestiona límites, vigencia y archivado seguro de lotes de material de control.")
-
-    analytes_all = load_analytes(conn)
-    if analytes_all.empty:
-        st.info("Primero debes crear al menos un analito.")
-        return
-
-    lots_df = fetchall_df(
-        conn,
-        """
-        SELECT l.id,a.nombre AS analito,a.unidad,l.nivel,l.lote,l.fabricante,l.material_control,
-               l.limite_inferior,l.nivel_medio,l.limite_superior,l.media_objetivo,l.de_objetivo,
-               l.fecha_vencimiento,l.vigente,l.fecha_creacion,
-               (SELECT COUNT(*) FROM resultados_cc r WHERE r.lote_control_id=l.id) AS resultados
-        FROM lotes_control l
-        JOIN analitos a ON a.id=l.analito_id AND a.organizacion_id=l.organizacion_id
-        WHERE l.organizacion_id=%s
-        ORDER BY a.nombre,l.nivel,l.fecha_creacion DESC
-        """,
-        (current_org_id(user),),
-    )
-
-    if not lots_df.empty:
-        view = lots_df.copy()
-        view["fecha_vencimiento"] = pd.to_datetime(view["fecha_vencimiento"], errors="coerce")
-        view["estado"] = view["vigente"].map({True: "Vigente", False: "Inactivo"})
-        expired = view["fecha_vencimiento"].notna() & (view["fecha_vencimiento"].dt.date < date.today()) & view["vigente"]
-        view.loc[expired, "estado"] = "Vencido"
-        st.dataframe(
-            view[["analito","nivel","lote","limite_inferior","nivel_medio","limite_superior","de_objetivo","fecha_vencimiento","resultados","estado"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    if user["rol"] != "Administrador":
-        st.info("La creación, archivado y restauración de lotes está disponible para Administradores.")
-        return
-
-    st.divider()
-    st.markdown("#### Crear nuevo lote")
-    st.caption("Los límites inferior y superior se interpretan como ±3 DE. TMQuality calcula automáticamente la DE para las reglas de Westgard.")
-    amap = {f"{r.nombre} · {r.unidad}": int(r.id) for r in analytes_all.itertuples()}
-    default_index = 0
-    preferred = st.session_state.get("new_lot_analyte_id")
-    if preferred:
-        for i, aid in enumerate(amap.values()):
-            if int(aid) == int(preferred): default_index = i; break
-
-    with st.form("new_lot_main", clear_on_submit=True):
-        al = st.selectbox("Analito", list(amap.keys()), index=default_index)
-        c1,c2 = st.columns(2)
-        with c1:
-            level = st.selectbox("Nivel del control", ["Bajo","Normal","Alto"])
-            lot_code = st.text_input("Código / número de lote", placeholder="Ej.: LOTE-2026-02")
-            mfg = st.text_input("Fabricante")
-            material = st.text_input("Material de control")
-            expiry = st.date_input("Fecha de vencimiento", value=date.today()+timedelta(days=365))
-        with c2:
-            lower = st.number_input("Límite inferior", value=0.7000, step=0.0001, format="%.4f")
-            middle = st.number_input("Nivel medio / valor objetivo", value=1.0000, step=0.0001, format="%.4f")
-            upper = st.number_input("Límite superior", value=1.3000, step=0.0001, format="%.4f")
-            deactivate_previous = st.checkbox("Desactivar lotes vigentes del mismo analito y nivel", value=False)
-        create_lot = st.form_submit_button("Crear lote de control", type="primary", use_container_width=True)
-
-    if create_lot:
-        if not lot_code.strip():
-            st.error("Debes ingresar el código o número de lote.")
-        elif not (lower < middle < upper):
-            st.error("Debe cumplirse: límite inferior < nivel medio < límite superior.")
-        else:
-            sd = (float(upper)-float(lower))/6.0
-            try:
-                with conn.cursor() as cur:
-                    if deactivate_previous:
-                        cur.execute("UPDATE lotes_control SET vigente=FALSE WHERE organizacion_id=%s AND analito_id=%s AND nivel=%s AND vigente=TRUE", (current_org_id(user),amap[al],level))
-                    cur.execute(
-                        """INSERT INTO lotes_control(
-                           organizacion_id,analito_id,nivel,lote,fabricante,material_control,fecha_vencimiento,
-                           limite_inferior,nivel_medio,limite_superior,media_objetivo,de_objetivo,vigente)
-                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE) RETURNING id""",
-                        (current_org_id(user),amap[al],level,lot_code.strip(),mfg.strip() or None,material.strip() or None,expiry,
-                         float(lower),float(middle),float(upper),float(middle),sd),
-                    )
-                    lid=cur.fetchone()[0]
-                conn.commit()
-                audit(conn,"LOTE_CREADO","lotes_control",lid,f"{lot_code.strip()} · límites {lower}/{middle}/{upper}")
-                st.session_state.pop("new_lot_analyte_id",None)
-                st.success(f"Lote creado. DE calculada: {sd:.6f}")
-                st.rerun()
-            except IntegrityError:
-                conn.rollback(); st.error("Ese lote ya existe para el analito y nivel seleccionados.")
-            except Exception as exc:
-                conn.rollback(); st.error(f"No fue posible crear el lote: {exc}")
-
-    if not lots_df.empty:
-        st.divider()
-        st.markdown("#### Gestionar lote")
-        options={f"{r.analito} · {r.nivel} · {r.lote}":int(r.id) for r in lots_df.itertuples()}
-        label=st.selectbox("Lote",list(options.keys()),key="lot_manage_select")
-        lot_id=options[label]
-        row=lots_df[lots_df.id==lot_id].iloc[0]
-        c1,c2=st.columns(2)
-        with c1:
-            if bool(row.vigente):
-                if st.button("Archivar lote", use_container_width=True, key=f"archive_lot_{lot_id}"):
-                    try:
-                        archive_lot(conn, lot_id, user)
-                        st.success("Lote archivado. Sus resultados permanecen intactos.")
-                        st.rerun()
-                    except Exception as exc:
-                        conn.rollback(); st.error(str(exc))
-            else:
-                if st.button("Restaurar lote", use_container_width=True, key=f"restore_lot_{lot_id}"):
-                    try:
-                        restore_lot(conn, lot_id, user)
-                        st.success("Lote restaurado.")
-                        st.rerun()
-                    except Exception as exc:
-                        conn.rollback(); st.error(str(exc))
-        with c2:
-            if bool(row.vigente):
-                st.info(f"Archivar conserva los {int(row.resultados)} resultado(s) del lote.")
-            else:
-                st.caption("Este lote está archivado y puede restaurarse en cualquier momento.")
-
 def module_admin(conn, user):
     st.subheader("Administración")
     if user["rol"] != "Administrador":
@@ -2827,6 +2652,11 @@ def module_admin(conn, user):
             unit = st.text_input("Unidad")
             method = st.text_input("Metodología")
             tea = st.number_input("Error Total Permitido (%)", min_value=0.0, value=0.0, step=0.1, help="Usa 0 si aún no está definido.")
+            raw_levels = st.text_area(
+                "Niveles de control",
+                value="Bajo, Normal, Alto",
+                help="Separa los niveles por comas o líneas. Ej.: Nivel 1, Nivel 2.",
+            )
             add = st.form_submit_button("Crear analito", type="primary")
         if add:
             try:
@@ -2834,11 +2664,37 @@ def module_admin(conn, user):
                     cur.execute("INSERT INTO analitos(organizacion_id,nombre,unidad,metodologia,error_total_permitido) VALUES(%s,%s,%s,%s,%s) RETURNING id",
                                 (current_org_id(user), n.strip(), unit.strip(), method.strip() or None, tea if tea > 0 else None))
                     aid = cur.fetchone()[0]
-                conn.commit(); audit(conn,"ANALITO_CREADO","analitos",aid,n); st.rerun()
+                conn.commit()
+                configured_levels = parse_control_levels(raw_levels) or ["Bajo","Normal","Alto"]
+                sync_control_levels(conn,int(aid),configured_levels)
+                audit(conn,"ANALITO_CREADO","analitos",aid,
+                      f"{n} · niveles: {', '.join(configured_levels)}")
+                st.rerun()
             except IntegrityError:
                 conn.rollback(); st.error("El analito ya existe.")
 
         if not analytes.empty:
+            st.markdown("##### Configurar niveles de control")
+            cfg_options={f"{r.nombre} ({r.unidad})":int(r.id) for r in analytes.itertuples()}
+            cfg_label=st.selectbox("Analito para configurar niveles",list(cfg_options.keys()),key="control_levels_analyte")
+            cfg_id=cfg_options[cfg_label]
+            cfg_df=load_control_levels(conn,cfg_id,only_active=True)
+            cfg_current=[] if cfg_df.empty else cfg_df["nombre"].astype(str).tolist()
+            raw_cfg_levels=st.text_area(
+                "Niveles activos",
+                value=", ".join(cfg_current),
+                key=f"control_levels_text_{cfg_id}",
+                help="Cada analito puede usar su propia nomenclatura. Los niveles retirados se archivan, no se borran.",
+            )
+            if st.button("Guardar niveles del analito",type="primary",use_container_width=True,key=f"save_control_levels_{cfg_id}"):
+                try:
+                    saved=sync_control_levels(conn,cfg_id,parse_control_levels(raw_cfg_levels))
+                    audit(conn,"NIVELES_CONTROL_ACTUALIZADOS","analitos",cfg_id,", ".join(saved))
+                    st.success("Niveles de control actualizados.")
+                    st.rerun()
+                except Exception as exc:
+                    conn.rollback(); st.error(str(exc))
+
             st.markdown("##### Archivar o restaurar analito")
             a_options = {
                 f"{r.nombre} ({r.unidad}) · {'Activo' if bool(r.activo) else 'Archivado'}": int(r.id)
@@ -2896,37 +2752,10 @@ def module_admin(conn, user):
                     except Exception as exc:
                         conn.rollback(); st.error(str(exc))
     with tab_l:
-        analytes = load_analytes(conn)
-        if analytes.empty:
-            st.info("Primero crea un analito.")
-        else:
-            amap = {f"{r.nombre} ({r.unidad})":int(r.id) for r in analytes.itertuples()}
-            with st.form("new_lot"):
-                al = st.selectbox("Analito", list(amap.keys()))
-                level = st.selectbox("Nivel", ["Bajo","Normal","Alto"])
-                lot_code = st.text_input("Lote")
-                mfg = st.text_input("Fabricante")
-                material = st.text_input("Material de control")
-                expiry = st.date_input("Vencimiento", value=date.today()+timedelta(days=365))
-                lower = st.number_input("Límite inferior", value=0.7000, step=0.0001, format="%.4f", key="admin_lot_lower")
-                middle = st.number_input("Nivel medio / valor objetivo", value=1.0000, step=0.0001, format="%.4f", key="admin_lot_middle")
-                upper = st.number_input("Límite superior", value=1.3000, step=0.0001, format="%.4f", key="admin_lot_upper")
-                create_lot = st.form_submit_button("Crear lote", type="primary")
-            if create_lot:
-                try:
-                    if not (lower < middle < upper):
-                        raise ValueError("Debe cumplirse: límite inferior < nivel medio < límite superior.")
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                        INSERT INTO lotes_control(organizacion_id,analito_id,nivel,lote,fabricante,material_control,fecha_vencimiento,limite_inferior,nivel_medio,limite_superior,media_objetivo,de_objetivo)
-                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
-                        """, (current_org_id(user),amap[al],level,lot_code.strip(),mfg.strip() or None,material.strip() or None,expiry,float(lower),float(middle),float(upper),float(middle),(float(upper)-float(lower))/6.0))
-                        lid=cur.fetchone()[0]
-                    conn.commit(); audit(conn,"LOTE_CREADO","lotes_control",lid,lot_code); st.rerun()
-                except IntegrityError:
-                    conn.rollback(); st.error("Ese lote ya existe para el analito/nivel seleccionado.")
-                except ValueError as exc:
-                    conn.rollback(); st.error(str(exc))
+        st.info("La creación y gestión de lotes se realiza ahora en el módulo “Lotes de control”.")
+        if st.button("Ir a Lotes de control",use_container_width=True,key="admin_go_lots"):
+            st.session_state.pending_nav="Lotes de control"
+            st.rerun()
 
 # -----------------------------------------------------------------------------
 # MAIN
