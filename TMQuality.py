@@ -3286,7 +3286,7 @@ def module_admin(conn, user):
             unit = st.text_input("Unidad")
             method = st.text_input("Metodología")
             tea = st.number_input("Error Total Permitido (%)", min_value=0.0, value=0.0, step=0.1, help="Usa 0 si aún no está definido.")
-            add = st.form_submit_button("Crear analito")
+            add = st.form_submit_button("Crear analito", type="primary")
         if add:
             try:
                 with conn.cursor() as cur:
@@ -3311,7 +3311,7 @@ def module_admin(conn, user):
                 expiry = st.date_input("Vencimiento", value=date.today()+timedelta(days=365))
                 mean = st.number_input("Media objetivo", value=1.0, format="%.4f")
                 sd = st.number_input("DE objetivo", min_value=0.000001, value=0.1, format="%.4f")
-                create_lot = st.form_submit_button("Crear lote")
+                create_lot = st.form_submit_button("Crear lote", type="primary")
             if create_lot:
                 try:
                     with conn.cursor() as cur:
