@@ -81,11 +81,8 @@ st.set_page_config(
 
 st.markdown(
     """
-<meta name="google" content="notranslate">
 <style>
-html, body, #root, .stApp { translate: no; }
-.notranslate { translate: no; }
-/* TMQuality 5.3 — interfaz clínica clara inspirada en dashboards SaaS modernos */
+/* TMQuality 4.0 — interfaz clínica clara inspirada en dashboards SaaS modernos */
 :root {
   --tmq-navy:#13233f; --tmq-blue:#1769d2; --tmq-blue-soft:#eaf3ff;
   --tmq-green:#0da778; --tmq-green-soft:#e9f8f3; --tmq-red:#ef334e;
