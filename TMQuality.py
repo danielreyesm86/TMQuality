@@ -62,10 +62,12 @@ from reportlab.platypus import (
 # de importación y el consumo de memoria de cada proceso Streamlit.
 # -----------------------------------------------------------------------------
 APP_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = APP_DIR / "assets"
+ASSETS_DIR = APP_DIR / "assets" / "logos"
 
 def _asset_b64(filename: str) -> str:
-    return base64.b64encode((ASSETS_DIR / filename).read_bytes()).decode("ascii")
+    """Carga un recurso visual desde assets/logos y lo convierte a base64."""
+    asset_path = ASSETS_DIR / filename
+    return base64.b64encode(asset_path.read_bytes()).decode("ascii")
 
 LOGO_FULL_B64 = _asset_b64("tmquality_logo_full.png")
 LOGO_ICON_B64 = _asset_b64("tmquality_logo_icon.png")
