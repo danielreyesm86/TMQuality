@@ -74,7 +74,7 @@ LOGO_ICON_B64 = _asset_b64("tmquality_logo_icon.png")
 
 
 
-APP_VERSION = "5.6.8"
+APP_VERSION = "5.6.9"
 PBKDF2_ITERATIONS = 260_000
 LEGACY_PBKDF2_ITERATIONS = 100_000
 ROLES = ["Administrador", "Supervisor", "Operador"]
@@ -2509,30 +2509,225 @@ def module_history(conn, user, analyte, lot, results):
 
 def module_analytics(conn, analyte, lot, results):
     st.subheader("Analítica de desempeño")
+    st.caption(
+        "Resumen estadístico del lote y evolución de la precisión a través del tiempo."
+    )
+
     if not analyte or not lot or results.empty:
         st.info("Se requieren resultados para calcular indicadores.")
         return
-    stats = qc_statistics(results, lot["media_objetivo"], analyte.get("error_total_permitido"))
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Media observada", f"{stats['mean']:.4f}")
-    c2.metric("DE observada", f"{stats['sd']:.4f}")
-    c3.metric("CV%", f"{stats['cv']:.2f}%" if stats['cv'] is not None else "—")
-    c4.metric("Sesgo%", f"{stats['bias']:.2f}%" if stats['bias'] is not None else "—")
-    if analyte.get("error_total_permitido") is None:
-        st.info("Define el Error Total Permitido (%) del analito para calcular Sigma.")
+
+    stats = qc_statistics(
+        results,
+        lot["media_objetivo"],
+        analyte.get("error_total_permitido"),
+    )
+
+    # ------------------------------------------------------------------
+    # Indicadores principales
+    # ------------------------------------------------------------------
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Media observada",
+        f"{stats['mean']:.4f}" if stats.get("mean") is not None else "—",
+        help="Promedio de los resultados de control registrados para el lote seleccionado.",
+    )
+    c2.metric(
+        "DE observada",
+        f"{stats['sd']:.4f}" if stats.get("sd") is not None else "—",
+        help="Desviación estándar observada de los resultados del lote.",
+    )
+    c3.metric(
+        "CV%",
+        f"{stats['cv']:.2f}%" if stats.get("cv") is not None else "—",
+        help="Coeficiente de variación: DE / media × 100. Resume la imprecisión observada.",
+    )
+    c4.metric(
+        "Sesgo%",
+        f"{stats['bias']:.2f}%" if stats.get("bias") is not None else "—",
+        help="Diferencia porcentual entre la media observada y el valor objetivo del lote.",
+    )
+
+    # Sigma ocupa su propia tarjeta porque depende del Error Total Permitido.
+    st.markdown("##### Métrica Sigma")
+    etp = analyte.get("error_total_permitido")
+    if etp is None:
+        st.info(
+            "Define el Error Total Permitido (%) del analito para calcular la Métrica Sigma."
+        )
     else:
-        sigma = stats["sigma"]
-        st.metric("Métrica Sigma", f"{sigma:.2f}" if sigma is not None else "—", help="(ET permitido − |sesgo|) / CV")
+        sigma = stats.get("sigma")
+        sigma_col, info_col = st.columns([1, 3])
+
+        with sigma_col:
+            st.metric(
+                "Sigma",
+                f"{sigma:.2f}" if sigma is not None else "—",
+                help="(Error Total Permitido − |sesgo|) / CV",
+            )
+
+        with info_col:
+            if sigma is None:
+                st.caption(
+                    "No es posible calcular Sigma con los resultados disponibles."
+                )
+            elif sigma >= 6:
+                st.success(
+                    "Desempeño Sigma muy alto para los parámetros actualmente configurados."
+                )
+            elif sigma >= 4:
+                st.info(
+                    "Desempeño Sigma intermedio-alto para los parámetros actualmente configurados."
+                )
+            elif sigma >= 3:
+                st.warning(
+                    "Desempeño Sigma moderado. Conviene vigilar la precisión y el sesgo del método."
+                )
+            else:
+                st.error(
+                    "Sigma < 3 con los parámetros actualmente configurados. "
+                    "Revisa precisión, sesgo y Error Total Permitido antes de interpretar el desempeño."
+                )
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # Tendencia mensual del CV
+    # ------------------------------------------------------------------
+    st.markdown("##### Tendencia mensual del CV%")
 
     temp = results.copy()
-    temp["fecha"] = pd.to_datetime(temp["fecha"])
-    temp["mes"] = temp["fecha"].dt.to_period("M").astype(str)
-    monthly = temp.groupby("mes").agg(media=("valor","mean"), de=("valor","std"), n=("valor","count")).reset_index()
+    temp["fecha"] = pd.to_datetime(temp["fecha"], errors="coerce")
+    temp["valor"] = pd.to_numeric(temp["valor"], errors="coerce")
+    temp = temp.dropna(subset=["fecha", "valor"]).copy()
+
+    if temp.empty:
+        st.info("No hay resultados válidos suficientes para calcular la tendencia mensual.")
+        return
+
+    temp["mes_periodo"] = temp["fecha"].dt.to_period("M")
+
+    monthly = (
+        temp.groupby("mes_periodo")
+        .agg(
+            media=("valor", "mean"),
+            de=("valor", "std"),
+            n=("valor", "count"),
+        )
+        .reset_index()
+        .sort_values("mes_periodo")
+    )
+
+    # El CV mensual requiere al menos 2 resultados dentro del mes para calcular DE.
     monthly["cv"] = monthly["de"] / monthly["media"] * 100
+    monthly_valid = monthly[
+        (monthly["n"] >= 2)
+        & monthly["cv"].notna()
+        & monthly["cv"].replace([float("inf"), float("-inf")], pd.NA).notna()
+    ].copy()
+
+    month_names = {
+        1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr",
+        5: "May", 6: "Jun", 7: "Jul", 8: "Ago",
+        9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
+    }
+
+    if not monthly_valid.empty:
+        monthly_valid["mes_label"] = monthly_valid["mes_periodo"].apply(
+            lambda p: f"{month_names.get(p.month, p.month)} {p.year}"
+        )
+
+    # Con un solo mes, el gráfico no representa una tendencia real.
+    if len(monthly_valid) < 2:
+        if len(monthly_valid) == 1:
+            only = monthly_valid.iloc[0]
+            st.info(
+                f"Actualmente hay un solo mes con datos suficientes para calcular CV% "
+                f"({only['mes_label']}: {only['cv']:.2f}%, n={int(only['n'])}). "
+                "Se requieren al menos 2 meses con resultados para mostrar una tendencia."
+            )
+        else:
+            st.info(
+                "Se requieren al menos 2 meses con un mínimo de 2 resultados válidos por mes "
+                "para mostrar la tendencia mensual del CV%."
+            )
+        return
+
+    # Gráfico de línea: más adecuado que barras para visualizar tendencia.
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=monthly["mes"], y=monthly["cv"], name="CV%"))
-    fig.update_layout(height=360, title="CV% por mes", yaxis_title="CV%")
-    st.plotly_chart(fig, use_container_width=True, theme="streamlit", config={"displaylogo": False})
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_valid["mes_label"],
+            y=monthly_valid["cv"],
+            mode="lines+markers",
+            line=dict(width=2.5),
+            marker=dict(size=9),
+            customdata=monthly_valid[["n", "media", "de"]].to_numpy(),
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "CV: <b>%{y:.2f}%</b><br>"
+                "n: %{customdata[0]:.0f}<br>"
+                "Media: %{customdata[1]:.4f}<br>"
+                "DE: %{customdata[2]:.4f}"
+                "<extra></extra>"
+            ),
+            name="CV%",
+        )
+    )
+
+    fig.update_layout(
+        height=390,
+        margin=dict(l=30, r=25, t=18, b=45),
+        xaxis_title="Mes",
+        yaxis_title="CV%",
+        hovermode="closest",
+        showlegend=False,
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#14213d", family="Arial"),
+    )
+    fig.update_xaxes(
+        type="category",
+        categoryorder="array",
+        categoryarray=monthly_valid["mes_label"].tolist(),
+        gridcolor="#edf1f6",
+        tickfont=dict(color="#6d7890"),
+        title_font=dict(color="#6d7890"),
+    )
+    fig.update_yaxes(
+        rangemode="tozero",
+        gridcolor="#edf1f6",
+        zeroline=False,
+        tickfont=dict(color="#6d7890"),
+        title_font=dict(color="#6d7890"),
+        ticksuffix="%",
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        theme=None,
+        config={"displaylogo": False},
+    )
+
+    # Resumen simple de dirección de la tendencia, sin sustituir interpretación clínica.
+    first_cv = float(monthly_valid.iloc[0]["cv"])
+    last_cv = float(monthly_valid.iloc[-1]["cv"])
+    delta_cv = last_cv - first_cv
+
+    if abs(delta_cv) < 0.01:
+        st.caption("El CV% se mantiene prácticamente estable entre el primer y el último mes mostrado.")
+    elif delta_cv < 0:
+        st.caption(
+            f"El CV% disminuyó {abs(delta_cv):.2f} puntos porcentuales entre "
+            "el primer y el último mes mostrado."
+        )
+    else:
+        st.caption(
+            f"El CV% aumentó {delta_cv:.2f} puntos porcentuales entre "
+            "el primer y el último mes mostrado."
+        )
 
 
 def module_equipment(conn, user):
