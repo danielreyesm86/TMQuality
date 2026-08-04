@@ -43,6 +43,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import psycopg2
 from psycopg2 import IntegrityError
 from psycopg2.extras import RealDictCursor
@@ -74,7 +75,7 @@ LOGO_ICON_B64 = _asset_b64("tmquality_logo_icon.png")
 
 
 
-APP_VERSION = "5.6.6"
+APP_VERSION = "5.6.7"
 PBKDF2_ITERATIONS = 260_000
 LEGACY_PBKDF2_ITERATIONS = 100_000
 ROLES = ["Administrador", "Supervisor", "Operador"]
@@ -1465,26 +1466,106 @@ def list_audit(conn, limit=1000):
 # GRÁFICOS Y PDF
 # -----------------------------------------------------------------------------
 def levey_jennings_figure(df: pd.DataFrame, mean: float, sd: float, unit: str):
-    """Levey–Jennings optimizado para navegación fluida.
+    """Levey–Jennings legible incluso cuando existen resultados extremos.
 
-    Los cálculos estadísticos usan el conjunto completo; el navegador renderiza
-    como máximo los 300 puntos más recientes para evitar gráficos pesados.
+    - Mantiene visibles TODOS los resultados reales en un panel general.
+    - Agrega un panel de detalle para la zona de control (±3 DE).
+    - Los resultados rechazados no se unen con la línea de tendencia para evitar
+      líneas verticales dominantes cuando existe un valor extremo.
+    - Las líneas de Media, ±1 DE, ±2 DE y ±3 DE se rotulan sin superponerse.
     """
     df = df.tail(300).copy()
-    fig = go.Figure()
-    if not df.empty:
-        x = pd.to_datetime(df["fecha"]).dt.strftime("%d-%m-%Y")
-        colors_pts = ["#0da778" if s == "Aceptado" else "#d99113" if s == "Advertencia" else "#ef334e" if s == "Rechazado" else "#1769d2" for s in df["estado"]]
-        fig.add_trace(go.Scatter(x=x, y=df["valor"], mode="lines+markers", name="Resultado",
-            line=dict(width=2.6, color="#1769d2"), marker=dict(size=8, color=colors_pts, line=dict(width=1.5,color="#ffffff")),
-            hovertemplate="%{x}<br><b>%{y:.4f} " + unit + "</b><extra></extra>"))
-    levels=[(0,"Media","solid","#13233f",2.2),(1,"+1 DE","dot","#8da0b8",1.3),(-1,"-1 DE","dot","#8da0b8",1.3),(2,"+2 DE","dash","#d99113",1.5),(-2,"-2 DE","dash","#d99113",1.5),(3,"+3 DE","solid","#ef334e",1.6),(-3,"-3 DE","solid","#ef334e",1.6)]
+    mean = float(mean)
+    sd = float(sd)
+
+    if df.empty or sd <= 0:
+        fig = go.Figure()
+        if not df.empty:
+            plot_df = df.copy()
+            plot_df["fecha_plot"] = pd.to_datetime(plot_df["fecha"], errors="coerce")
+            fig.add_trace(go.Scatter(
+                x=plot_df["fecha_plot"],
+                y=pd.to_numeric(plot_df["valor"], errors="coerce"),
+                mode="markers",
+                marker=dict(size=9, color="#1769d2", line=dict(width=1.5, color="#ffffff")),
+                hovertemplate="%{x|%d-%m-%Y}<br><b>%{y:.4f} " + unit + "</b><extra></extra>",
+                name="Resultado",
+            ))
+        fig.update_layout(height=455, margin=dict(l=22,r=24,t=24,b=42), xaxis_title="Fecha", yaxis_title=unit,
+            paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font=dict(color="#14213d",family="Arial"), showlegend=False)
+        return fig
+
+    plot_df = df.copy()
+    plot_df["fecha_plot"] = pd.to_datetime(plot_df["fecha"], errors="coerce")
+    plot_df["valor_plot"] = pd.to_numeric(plot_df["valor"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["fecha_plot", "valor_plot"]).copy()
+
+    if not plot_df.empty:
+        duplicate_idx = plot_df.groupby("fecha_plot").cumcount()
+        duplicate_count = plot_df.groupby("fecha_plot")["fecha_plot"].transform("size")
+        offset_minutes = duplicate_idx - (duplicate_count - 1) / 2
+        plot_df["fecha_plot"] = plot_df["fecha_plot"] + pd.to_timedelta(offset_minutes * 18, unit="m")
+
+    status_colors = {"Aceptado":"#0da778","Advertencia":"#d99113","Rechazado":"#ef334e","Pendiente":"#1769d2"}
+    plot_df["color"] = plot_df["estado"].map(status_colors).fillna("#1769d2")
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.10,
+                        row_heights=[0.58,0.42], subplot_titles=("Rango completo","Detalle de la zona de control"))
+
+    trend_y = plot_df["valor_plot"].where(plot_df["estado"] != "Rechazado")
+    for row in (1,2):
+        fig.add_trace(go.Scatter(x=plot_df["fecha_plot"], y=trend_y, mode="lines",
+                                 line=dict(width=2.2,color="#1769d2"), hoverinfo="skip",
+                                 connectgaps=False, showlegend=False, name="Tendencia"), row=row, col=1)
+        fig.add_trace(go.Scatter(x=plot_df["fecha_plot"], y=plot_df["valor_plot"], mode="markers",
+                                 marker=dict(size=9,color=plot_df["color"],line=dict(width=1.5,color="#ffffff")),
+                                 customdata=plot_df[["estado"]].to_numpy(),
+                                 hovertemplate="%{x|%d-%m-%Y}<br><b>%{y:.4f} " + unit + "</b><br>Estado: %{customdata[0]}<extra></extra>",
+                                 showlegend=False, name="Resultado"), row=row, col=1)
+
+    control_bands=[(-3,-2,"rgba(239,51,78,0.06)"),(-2,-1,"rgba(217,145,19,0.06)"),(-1,1,"rgba(13,167,120,0.055)"),(1,2,"rgba(217,145,19,0.06)"),(2,3,"rgba(239,51,78,0.06)")]
+    for low_mult,high_mult,fill in control_bands:
+        fig.add_hrect(y0=mean+low_mult*sd,y1=mean+high_mult*sd,fillcolor=fill,line_width=0,row=2,col=1,layer="below")
+
+    levels=[(0,"Media","solid","#13233f",2.1),(1,"+1 DE","dot","#8da0b8",1.2),(-1,"-1 DE","dot","#8da0b8",1.2),(2,"+2 DE","dash","#d99113",1.4),(-2,"-2 DE","dash","#d99113",1.4),(3,"+3 DE","solid","#ef334e",1.5),(-3,"-3 DE","solid","#ef334e",1.5)]
     for mult,label,dash,color,width in levels:
-        fig.add_hline(y=mean+mult*sd,line_dash=dash,line_color=color,line_width=width,annotation_text=label,annotation_position="right",annotation_font_color="#6d7890")
-    fig.update_layout(height=455,margin=dict(l=22,r=62,t=24,b=18),xaxis_title="Fecha",yaxis_title=unit,hovermode="x unified",showlegend=False,
-        paper_bgcolor="#ffffff",plot_bgcolor="#ffffff",font=dict(color="#14213d",family="Arial"),
-        xaxis=dict(gridcolor="#edf1f6",zeroline=False,tickfont=dict(color="#6d7890"),title_font=dict(color="#6d7890")),
-        yaxis=dict(gridcolor="#edf1f6",zeroline=False,tickfont=dict(color="#6d7890"),title_font=dict(color="#6d7890")))
+        y_ref=mean+mult*sd
+        fig.add_hline(y=y_ref,line_dash=dash,line_color=color,line_width=width,row=1,col=1)
+        fig.add_hline(y=y_ref,line_dash=dash,line_color=color,line_width=width,row=2,col=1)
+
+    for mult,label,_,color,_ in levels:
+        y_ref=mean+mult*sd
+        fig.add_annotation(x=1.006,xref="paper",y=y_ref,yref="y2",text=label,showarrow=False,
+                           xanchor="left",yanchor="middle",font=dict(size=11,color=color),
+                           bgcolor="rgba(255,255,255,0.78)",borderpad=2)
+
+    detail_pad=max(sd*0.55,abs(mean)*0.015,1e-6)
+    fig.update_yaxes(range=[mean-3*sd-detail_pad, mean+3*sd+detail_pad], row=2, col=1)
+
+    extreme=plot_df[(plot_df["valor_plot"]<mean-3*sd)|(plot_df["valor_plot"]>mean+3*sd)]
+    if not extreme.empty:
+        worst_idx=((extreme["valor_plot"]-mean).abs()).idxmax()
+        worst=extreme.loc[worst_idx]
+        fig.add_annotation(x=worst["fecha_plot"],y=worst["valor_plot"],xref="x",yref="y",
+                           text=f"Fuera de ±3 DE<br><b>{worst['valor_plot']:.4f} {unit}</b>",showarrow=True,
+                           arrowhead=2,arrowsize=1,arrowwidth=1.4,arrowcolor="#ef334e",ax=-55,ay=-45,
+                           bgcolor="#fff5f6",bordercolor="#ef334e",borderwidth=1,borderpad=5,
+                           font=dict(size=11,color="#b4233a"))
+
+    fig.update_layout(height=650,margin=dict(l=30,r=88,t=48,b=46),hovermode="closest",showlegend=False,
+                      paper_bgcolor="#ffffff",plot_bgcolor="#ffffff",font=dict(color="#14213d",family="Arial"))
+    fig.update_xaxes(title_text="Fecha",row=2,col=1,gridcolor="#edf1f6",zeroline=False,
+                     tickfont=dict(color="#6d7890"),title_font=dict(color="#6d7890"),tickformat="%d-%m-%Y")
+    fig.update_xaxes(gridcolor="#edf1f6",zeroline=False,tickfont=dict(color="#6d7890"),row=1,col=1)
+    for row in (1,2):
+        fig.update_yaxes(title_text=unit,row=row,col=1,gridcolor="#edf1f6",zeroline=False,
+                         tickfont=dict(color="#6d7890"),title_font=dict(color="#6d7890"))
+
+    for annotation in fig.layout.annotations:
+        if annotation.text in ("Rango completo","Detalle de la zona de control"):
+            annotation.font=dict(size=12,color="#6d7890")
+            annotation.x=0
+            annotation.xanchor="left"
     return fig
 
 
@@ -2095,6 +2176,78 @@ def module_register(conn, user, analyte, lot, results):
         st.rerun()
 
 
+
+def delete_qc_result(conn, result_id: int, user: dict, lot: dict) -> int:
+    """Elimina definitivamente un resultado y recalcula cronológicamente el lote.
+
+    Devuelve la cantidad de resultados reevaluados después de la eliminación.
+    La acción queda registrada en auditoría con los datos esenciales del resultado.
+    """
+    org_id = current_org_id(user)
+    row = fetchone(
+        conn,
+        """
+        SELECT r.id, r.lote_control_id, r.fecha, r.turno, r.operador, r.valor,
+               r.z_score, r.estado, r.reglas_violadas, r.comentarios,
+               l.lote, l.nivel, a.nombre AS analito, a.unidad
+        FROM resultados_cc r
+        JOIN lotes_control l
+          ON l.id=r.lote_control_id
+         AND l.organizacion_id=r.organizacion_id
+        JOIN analitos a
+          ON a.id=l.analito_id
+         AND a.organizacion_id=l.organizacion_id
+        WHERE r.id=%s
+          AND r.organizacion_id=%s
+          AND r.lote_control_id=%s
+        """,
+        (int(result_id), org_id, int(lot["id"])),
+    )
+    if not row:
+        raise ValueError("El resultado no existe o no pertenece al lote seleccionado.")
+
+    detail = (
+        f"{row['analito']} · {row['nivel']} · lote {row['lote']} · "
+        f"fecha {row['fecha']} · valor {row['valor']} {row['unidad']} · "
+        f"estado {row['estado']}"
+    )
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM resultados_cc
+                WHERE id=%s
+                  AND organizacion_id=%s
+                  AND lote_control_id=%s
+                """,
+                (int(result_id), org_id, int(lot["id"])),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("No fue posible identificar un único resultado para eliminar.")
+        conn.commit()
+
+        n_actualizados = recalcular_reglas_lote(
+            conn,
+            int(lot["id"]),
+            float(lot["media_objetivo"]),
+            float(lot["de_objetivo"]),
+        )
+
+        audit(
+            conn,
+            "RESULTADO_ELIMINADO",
+            "resultados_cc",
+            int(result_id),
+            detail + f" · eliminación permanente · {n_actualizados} resultado(s) reevaluados",
+        )
+        return int(n_actualizados)
+
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def module_history(conn, user, analyte, lot, results):
     st.subheader("Historial y acciones correctivas")
     if not lot or results.empty:
@@ -2162,6 +2315,58 @@ def module_history(conn, user, analyte, lot, results):
         audit(conn, "RESULTADO_REVISADO", "resultados_cc", rid, "Acción correctiva/comentario actualizado")
         st.success("Revisión guardada.")
         st.rerun()
+
+    if user["rol"] == "Administrador":
+        st.divider()
+        st.markdown("#### Eliminar resultado")
+        st.warning(
+            "La eliminación es permanente y no se puede deshacer. "
+            "Al eliminar un resultado, TMQuality recalculará automáticamente "
+            "las reglas de Westgard de todo el lote porque la secuencia cronológica cambia."
+        )
+
+        result_date = row.get("fecha")
+        result_value = row.get("valor")
+        result_state = row.get("estado") or "—"
+        st.info(
+            f"Resultado seleccionado: ID {int(rid)} · "
+            f"{result_date} · {float(result_value):.4f} {analyte['unidad']} · "
+            f"Estado: {result_state}"
+        )
+
+        confirm_delete = st.checkbox(
+            "Confirmo que revisé el resultado seleccionado y deseo eliminarlo permanentemente.",
+            key=f"confirm_delete_result_{int(rid)}",
+        )
+
+        typed_id = ""
+        if confirm_delete:
+            typed_id = st.text_input(
+                f"Para confirmar, escribe exactamente el ID del resultado: {int(rid)}",
+                key=f"type_delete_result_{int(rid)}",
+            )
+
+        if st.button(
+            "Eliminar resultado definitivamente",
+            type="primary",
+            use_container_width=True,
+            key=f"delete_result_{int(rid)}",
+            disabled=(not confirm_delete or typed_id.strip() != str(int(rid))),
+        ):
+            try:
+                n_actualizados = delete_qc_result(conn, int(rid), user, lot)
+                st.success(
+                    f"Resultado ID {int(rid)} eliminado. "
+                    f"Se reevaluaron {n_actualizados} resultado(s) del lote."
+                )
+                st.rerun()
+            except Exception as exc:
+                conn.rollback()
+                st.error(f"No fue posible eliminar el resultado: {exc}")
+    else:
+        st.caption(
+            "La eliminación permanente de resultados está disponible solo para Administradores."
+        )
 
 
 def module_analytics(conn, analyte, lot, results):
