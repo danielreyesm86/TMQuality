@@ -231,38 +231,73 @@ def module_lots(conn, user):
         elif not (lower < middle < upper):
             st.error("Debe cumplirse: límite inferior < nivel medio < límite superior.")
         else:
-            sd = (float(upper)-float(lower))/6.0
-            try:
-                with conn.cursor() as cur:
-                    if deactivate_previous:
+            org_id = current_org_id(user)
+            normalized_lot = lot_code.strip()
+
+            # Validación explícita: un lote se considera duplicado únicamente
+            # cuando coincide organización + analito + nivel + código de lote.
+            # Se incluyen lotes archivados porque siguen existiendo en la BD.
+            duplicate = fetchone(
+                conn,
+                """
+                SELECT id, vigente
+                FROM lotes_control
+                WHERE organizacion_id=%s
+                  AND analito_id=%s
+                  AND nivel=%s
+                  AND LOWER(TRIM(lote))=LOWER(TRIM(%s))
+                LIMIT 1
+                """,
+                (org_id, selected["id"], level, normalized_lot),
+            )
+
+            if duplicate:
+                estado = "vigente" if bool(duplicate.get("vigente")) else "archivado"
+                st.error(
+                    f"El lote '{normalized_lot}' ya existe para {selected['nombre']} · "
+                    f"{level} y está {estado}. Puedes gestionarlo en la sección de lotes."
+                )
+            else:
+                sd = (float(upper)-float(lower))/6.0
+                try:
+                    with conn.cursor() as cur:
+                        if deactivate_previous:
+                            cur.execute(
+                                """UPDATE lotes_control SET vigente=FALSE
+                                   WHERE organizacion_id=%s AND analito_id=%s AND nivel=%s AND vigente=TRUE""",
+                                (org_id, selected["id"], level)
+                            )
                         cur.execute(
-                            """UPDATE lotes_control SET vigente=FALSE
-                               WHERE organizacion_id=%s AND analito_id=%s AND nivel=%s AND vigente=TRUE""",
-                            (current_org_id(user),selected["id"],level)
+                            """INSERT INTO lotes_control(
+                               organizacion_id,analito_id,nivel,lote,fabricante,material_control,
+                               fecha_vencimiento,limite_inferior,nivel_medio,limite_superior,
+                               media_objetivo,de_objetivo,vigente)
+                               VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE) RETURNING id""",
+                            (org_id,selected["id"],level,normalized_lot,
+                             mfg.strip() or None,material.strip() or None,expiry,
+                             float(lower),float(middle),float(upper),float(middle),sd)
                         )
-                    cur.execute(
-                        """INSERT INTO lotes_control(
-                           organizacion_id,analito_id,nivel,lote,fabricante,material_control,
-                           fecha_vencimiento,limite_inferior,nivel_medio,limite_superior,
-                           media_objetivo,de_objetivo,vigente)
-                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE) RETURNING id""",
-                        (current_org_id(user),selected["id"],level,lot_code.strip(),
-                         mfg.strip() or None,material.strip() or None,expiry,
-                         float(lower),float(middle),float(upper),float(middle),sd)
+                        lid=cur.fetchone()[0]
+                    conn.commit()
+                    audit(conn,"LOTE_CREADO","lotes_control",lid,
+                          f"{selected['nombre']} · {level} · {normalized_lot}")
+                    st.session_state.pop("new_lot_analyte_id",None)
+                    st.success(f"Lote creado. DE calculada: {sd:.6f}")
+                    st.rerun()
+                except IntegrityError as exc:
+                    conn.rollback()
+                    constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+                    detail = getattr(getattr(exc, "diag", None), "message_detail", None)
+                    extra = f" Restricción: {constraint}." if constraint else ""
+                    if detail:
+                        extra += f" Detalle: {detail}"
+                    st.error(
+                        "La base de datos rechazó el nuevo lote por una restricción de integridad."
+                        + extra
                     )
-                    lid=cur.fetchone()[0]
-                conn.commit()
-                audit(conn,"LOTE_CREADO","lotes_control",lid,
-                      f"{selected['nombre']} · {level} · {lot_code.strip()}")
-                st.session_state.pop("new_lot_analyte_id",None)
-                st.success(f"Lote creado. DE calculada: {sd:.6f}")
-                st.rerun()
-            except IntegrityError:
-                conn.rollback()
-                st.error("Ese lote ya existe para el analito y nivel seleccionados.")
-            except Exception as exc:
-                conn.rollback()
-                st.error(f"No fue posible crear el lote: {exc}")
+                except Exception as exc:
+                    conn.rollback()
+                    st.error(f"No fue posible crear el lote: {exc}")
 
     if not lots_df.empty:
         st.divider()
