@@ -446,6 +446,43 @@ def init_db(conn):
         except Exception:
             conn.rollback()
 
+
+    # -----------------------------------------------------------------
+    # Compatibilidad con niveles de control configurables.
+    # Versiones antiguas de TMQuality podían tener un CHECK fijo sobre
+    # lotes_control.nivel (por ejemplo Bajo/Normal/Alto). Esa restricción
+    # es incompatible con niveles personalizados por analito.
+    # -----------------------------------------------------------------
+    try:
+        row = fetchone(
+            conn,
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname='lotes_control_nivel_check'
+                  AND conrelid='public.lotes_control'::regclass
+            ) AS ok
+            """,
+        )
+        if row and row.get("ok"):
+            execute(
+                conn,
+                'ALTER TABLE public.lotes_control DROP CONSTRAINT "lotes_control_nivel_check"'
+            )
+    except Exception as exc:
+        conn.rollback()
+        st.error(
+            "No fue posible retirar la restricción antigua de niveles de control."
+        )
+        st.code(str(exc))
+        st.info(
+            "Ejecuta una sola vez en Supabase SQL Editor: "
+            'ALTER TABLE public.lotes_control DROP CONSTRAINT IF EXISTS '
+            '"lotes_control_nivel_check";'
+        )
+        st.stop()
+
     # No modificar RLS, GRANT/REVOKE ni constraints globales durante un rerun.
     # Esas tareas administrativas deben hacerse una sola vez desde Supabase.
 
