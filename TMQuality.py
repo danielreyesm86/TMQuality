@@ -74,7 +74,7 @@ LOGO_ICON_B64 = _asset_b64("tmquality_logo_icon.png")
 
 
 
-APP_VERSION = "5.6.5"
+APP_VERSION = "5.6.6"
 PBKDF2_ITERATIONS = 260_000
 LEGACY_PBKDF2_ITERATIONS = 100_000
 ROLES = ["Administrador", "Supervisor", "Operador"]
