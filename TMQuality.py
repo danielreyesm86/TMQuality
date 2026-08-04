@@ -43,7 +43,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import psycopg2
 from psycopg2 import IntegrityError
 from psycopg2.extras import RealDictCursor
@@ -75,7 +74,7 @@ LOGO_ICON_B64 = _asset_b64("tmquality_logo_icon.png")
 
 
 
-APP_VERSION = "5.6.7"
+APP_VERSION = "5.6.8"
 PBKDF2_ITERATIONS = 260_000
 LEGACY_PBKDF2_ITERATIONS = 100_000
 ROLES = ["Administrador", "Supervisor", "Operador"]
@@ -1466,106 +1465,245 @@ def list_audit(conn, limit=1000):
 # GRÁFICOS Y PDF
 # -----------------------------------------------------------------------------
 def levey_jennings_figure(df: pd.DataFrame, mean: float, sd: float, unit: str):
-    """Levey–Jennings legible incluso cuando existen resultados extremos.
+    """Gráfico Levey–Jennings único, legible y con reglas Westgard en el hover.
 
-    - Mantiene visibles TODOS los resultados reales en un panel general.
-    - Agrega un panel de detalle para la zona de control (±3 DE).
-    - Los resultados rechazados no se unen con la línea de tendencia para evitar
-      líneas verticales dominantes cuando existe un valor extremo.
-    - Las líneas de Media, ±1 DE, ±2 DE y ±3 DE se rotulan sin superponerse.
+    Los valores extremadamente alejados no deforman la escala del gráfico:
+    se representan en el borde superior/inferior como puntos fuera de escala,
+    conservando en el hover su valor real y las reglas infringidas.
     """
     df = df.tail(300).copy()
     mean = float(mean)
     sd = float(sd)
 
-    if df.empty or sd <= 0:
-        fig = go.Figure()
-        if not df.empty:
-            plot_df = df.copy()
-            plot_df["fecha_plot"] = pd.to_datetime(plot_df["fecha"], errors="coerce")
-            fig.add_trace(go.Scatter(
-                x=plot_df["fecha_plot"],
-                y=pd.to_numeric(plot_df["valor"], errors="coerce"),
-                mode="markers",
-                marker=dict(size=9, color="#1769d2", line=dict(width=1.5, color="#ffffff")),
-                hovertemplate="%{x|%d-%m-%Y}<br><b>%{y:.4f} " + unit + "</b><extra></extra>",
-                name="Resultado",
-            ))
-        fig.update_layout(height=455, margin=dict(l=22,r=24,t=24,b=42), xaxis_title="Fecha", yaxis_title=unit,
-            paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font=dict(color="#14213d",family="Arial"), showlegend=False)
+    fig = go.Figure()
+
+    if df.empty:
+        fig.update_layout(
+            height=500,
+            margin=dict(l=30, r=90, t=30, b=48),
+            xaxis_title="Fecha",
+            yaxis_title=unit,
+            paper_bgcolor="#ffffff",
+            plot_bgcolor="#ffffff",
+            font=dict(color="#14213d", family="Arial"),
+            showlegend=False,
+        )
         return fig
 
     plot_df = df.copy()
     plot_df["fecha_plot"] = pd.to_datetime(plot_df["fecha"], errors="coerce")
-    plot_df["valor_plot"] = pd.to_numeric(plot_df["valor"], errors="coerce")
-    plot_df = plot_df.dropna(subset=["fecha_plot", "valor_plot"]).copy()
+    plot_df["valor_real"] = pd.to_numeric(plot_df["valor"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["fecha_plot", "valor_real"]).copy()
 
+    # Separar levemente resultados registrados el mismo día para evitar líneas verticales.
     if not plot_df.empty:
         duplicate_idx = plot_df.groupby("fecha_plot").cumcount()
         duplicate_count = plot_df.groupby("fecha_plot")["fecha_plot"].transform("size")
         offset_minutes = duplicate_idx - (duplicate_count - 1) / 2
-        plot_df["fecha_plot"] = plot_df["fecha_plot"] + pd.to_timedelta(offset_minutes * 18, unit="m")
+        plot_df["fecha_plot"] = plot_df["fecha_plot"] + pd.to_timedelta(
+            offset_minutes * 18, unit="m"
+        )
 
-    status_colors = {"Aceptado":"#0da778","Advertencia":"#d99113","Rechazado":"#ef334e","Pendiente":"#1769d2"}
+    # Reglas Westgard para mostrar en el hover.
+    if "reglas_violadas" in plot_df.columns:
+        plot_df["reglas_hover"] = (
+            plot_df["reglas_violadas"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .replace({"": "Ninguna", "None": "Ninguna", "nan": "Ninguna"})
+        )
+    else:
+        plot_df["reglas_hover"] = "Ninguna"
+
+    if "estado" not in plot_df.columns:
+        plot_df["estado"] = "Pendiente"
+
+    status_colors = {
+        "Aceptado": "#0da778",
+        "Advertencia": "#d99113",
+        "Rechazado": "#ef334e",
+        "Pendiente": "#1769d2",
+    }
     plot_df["color"] = plot_df["estado"].map(status_colors).fillna("#1769d2")
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.10,
-                        row_heights=[0.58,0.42], subplot_titles=("Rango completo","Detalle de la zona de control"))
+    # Rango visual fijo alrededor de la zona útil de control.
+    # Los valores extremos se muestran en el borde, pero su valor real permanece en hover.
+    if sd > 0:
+        visual_pad = max(sd * 0.55, abs(mean) * 0.015, 1e-6)
+        visual_min = mean - 3 * sd - visual_pad
+        visual_max = mean + 3 * sd + visual_pad
 
-    trend_y = plot_df["valor_plot"].where(plot_df["estado"] != "Rechazado")
-    for row in (1,2):
-        fig.add_trace(go.Scatter(x=plot_df["fecha_plot"], y=trend_y, mode="lines",
-                                 line=dict(width=2.2,color="#1769d2"), hoverinfo="skip",
-                                 connectgaps=False, showlegend=False, name="Tendencia"), row=row, col=1)
-        fig.add_trace(go.Scatter(x=plot_df["fecha_plot"], y=plot_df["valor_plot"], mode="markers",
-                                 marker=dict(size=9,color=plot_df["color"],line=dict(width=1.5,color="#ffffff")),
-                                 customdata=plot_df[["estado"]].to_numpy(),
-                                 hovertemplate="%{x|%d-%m-%Y}<br><b>%{y:.4f} " + unit + "</b><br>Estado: %{customdata[0]}<extra></extra>",
-                                 showlegend=False, name="Resultado"), row=row, col=1)
+        plot_df["fuera_escala"] = (
+            (plot_df["valor_real"] < visual_min)
+            | (plot_df["valor_real"] > visual_max)
+        )
 
-    control_bands=[(-3,-2,"rgba(239,51,78,0.06)"),(-2,-1,"rgba(217,145,19,0.06)"),(-1,1,"rgba(13,167,120,0.055)"),(1,2,"rgba(217,145,19,0.06)"),(2,3,"rgba(239,51,78,0.06)")]
-    for low_mult,high_mult,fill in control_bands:
-        fig.add_hrect(y0=mean+low_mult*sd,y1=mean+high_mult*sd,fillcolor=fill,line_width=0,row=2,col=1,layer="below")
+        cap_margin = max(sd * 0.18, visual_pad * 0.35, 1e-6)
+        plot_df["valor_plot"] = plot_df["valor_real"].clip(
+            lower=visual_min + cap_margin,
+            upper=visual_max - cap_margin,
+        )
 
-    levels=[(0,"Media","solid","#13233f",2.1),(1,"+1 DE","dot","#8da0b8",1.2),(-1,"-1 DE","dot","#8da0b8",1.2),(2,"+2 DE","dash","#d99113",1.4),(-2,"-2 DE","dash","#d99113",1.4),(3,"+3 DE","solid","#ef334e",1.5),(-3,"-3 DE","solid","#ef334e",1.5)]
-    for mult,label,dash,color,width in levels:
-        y_ref=mean+mult*sd
-        fig.add_hline(y=y_ref,line_dash=dash,line_color=color,line_width=width,row=1,col=1)
-        fig.add_hline(y=y_ref,line_dash=dash,line_color=color,line_width=width,row=2,col=1)
+        plot_df["nota_escala"] = plot_df["fuera_escala"].map(
+            {True: "Fuera de escala visual", False: "Dentro de escala"}
+        )
+    else:
+        visual_min = float(plot_df["valor_real"].min())
+        visual_max = float(plot_df["valor_real"].max())
+        if visual_min == visual_max:
+            visual_min -= 1
+            visual_max += 1
+        plot_df["fuera_escala"] = False
+        plot_df["valor_plot"] = plot_df["valor_real"]
+        plot_df["nota_escala"] = "Dentro de escala"
 
-    for mult,label,_,color,_ in levels:
-        y_ref=mean+mult*sd
-        fig.add_annotation(x=1.006,xref="paper",y=y_ref,yref="y2",text=label,showarrow=False,
-                           xanchor="left",yanchor="middle",font=dict(size=11,color=color),
-                           bgcolor="rgba(255,255,255,0.78)",borderpad=2)
+    # Línea de tendencia: no unir resultados rechazados ni puntos fuera de escala.
+    trend_y = plot_df["valor_plot"].where(
+        (plot_df["estado"] != "Rechazado") & (~plot_df["fuera_escala"])
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["fecha_plot"],
+            y=trend_y,
+            mode="lines",
+            line=dict(width=2.1, color="#1769d2"),
+            hoverinfo="skip",
+            connectgaps=False,
+            showlegend=False,
+            name="Tendencia",
+        )
+    )
 
-    detail_pad=max(sd*0.55,abs(mean)*0.015,1e-6)
-    fig.update_yaxes(range=[mean-3*sd-detail_pad, mean+3*sd+detail_pad], row=2, col=1)
+    # Símbolo especial para puntos fuera de escala.
+    symbols = [
+        "triangle-up" if outside and real > visual_max
+        else "triangle-down" if outside
+        else "circle"
+        for outside, real in zip(plot_df["fuera_escala"], plot_df["valor_real"])
+    ]
+    sizes = [12 if outside else 9 for outside in plot_df["fuera_escala"]]
 
-    extreme=plot_df[(plot_df["valor_plot"]<mean-3*sd)|(plot_df["valor_plot"]>mean+3*sd)]
-    if not extreme.empty:
-        worst_idx=((extreme["valor_plot"]-mean).abs()).idxmax()
-        worst=extreme.loc[worst_idx]
-        fig.add_annotation(x=worst["fecha_plot"],y=worst["valor_plot"],xref="x",yref="y",
-                           text=f"Fuera de ±3 DE<br><b>{worst['valor_plot']:.4f} {unit}</b>",showarrow=True,
-                           arrowhead=2,arrowsize=1,arrowwidth=1.4,arrowcolor="#ef334e",ax=-55,ay=-45,
-                           bgcolor="#fff5f6",bordercolor="#ef334e",borderwidth=1,borderpad=5,
-                           font=dict(size=11,color="#b4233a"))
+    customdata = plot_df[
+        ["estado", "reglas_hover", "valor_real", "nota_escala"]
+    ].to_numpy()
 
-    fig.update_layout(height=650,margin=dict(l=30,r=88,t=48,b=46),hovermode="closest",showlegend=False,
-                      paper_bgcolor="#ffffff",plot_bgcolor="#ffffff",font=dict(color="#14213d",family="Arial"))
-    fig.update_xaxes(title_text="Fecha",row=2,col=1,gridcolor="#edf1f6",zeroline=False,
-                     tickfont=dict(color="#6d7890"),title_font=dict(color="#6d7890"),tickformat="%d-%m-%Y")
-    fig.update_xaxes(gridcolor="#edf1f6",zeroline=False,tickfont=dict(color="#6d7890"),row=1,col=1)
-    for row in (1,2):
-        fig.update_yaxes(title_text=unit,row=row,col=1,gridcolor="#edf1f6",zeroline=False,
-                         tickfont=dict(color="#6d7890"),title_font=dict(color="#6d7890"))
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["fecha_plot"],
+            y=plot_df["valor_plot"],
+            mode="markers",
+            marker=dict(
+                size=sizes,
+                symbol=symbols,
+                color=plot_df["color"],
+                line=dict(width=1.5, color="#ffffff"),
+            ),
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{x|%d-%m-%Y}</b><br>"
+                "Resultado: <b>%{customdata[2]:.4f} " + unit + "</b><br>"
+                "Estado: %{customdata[0]}<br>"
+                "Regla(s) infringida(s): <b>%{customdata[1]}</b><br>"
+                "%{customdata[3]}"
+                "<extra></extra>"
+            ),
+            showlegend=False,
+            name="Resultado",
+        )
+    )
 
-    for annotation in fig.layout.annotations:
-        if annotation.text in ("Rango completo","Detalle de la zona de control"):
-            annotation.font=dict(size=12,color="#6d7890")
-            annotation.x=0
-            annotation.xanchor="left"
+    if sd > 0:
+        # Bandas visuales de control.
+        bands = [
+            (-3, -2, "rgba(239,51,78,0.055)"),
+            (-2, -1, "rgba(217,145,19,0.055)"),
+            (-1,  1, "rgba(13,167,120,0.045)"),
+            ( 1,  2, "rgba(217,145,19,0.055)"),
+            ( 2,  3, "rgba(239,51,78,0.055)"),
+        ]
+        for low_mult, high_mult, fill in bands:
+            fig.add_hrect(
+                y0=mean + low_mult * sd,
+                y1=mean + high_mult * sd,
+                fillcolor=fill,
+                line_width=0,
+                layer="below",
+            )
+
+        levels = [
+            (0,  "Media", "solid", "#13233f", 2.1),
+            (1,  "+1 DE", "dot",   "#8da0b8", 1.2),
+            (-1, "-1 DE", "dot",   "#8da0b8", 1.2),
+            (2,  "+2 DE", "dash",  "#d99113", 1.4),
+            (-2, "-2 DE", "dash",  "#d99113", 1.4),
+            (3,  "+3 DE", "solid", "#ef334e", 1.5),
+            (-3, "-3 DE", "solid", "#ef334e", 1.5),
+        ]
+
+        for mult, label, dash, color, width in levels:
+            y_ref = mean + mult * sd
+            fig.add_hline(
+                y=y_ref,
+                line_dash=dash,
+                line_color=color,
+                line_width=width,
+            )
+            fig.add_annotation(
+                x=1.006,
+                xref="paper",
+                y=y_ref,
+                yref="y",
+                text=label,
+                showarrow=False,
+                xanchor="left",
+                yanchor="middle",
+                font=dict(size=11, color=color),
+                bgcolor="rgba(255,255,255,0.82)",
+                borderpad=2,
+            )
+
+        fig.update_yaxes(range=[visual_min, visual_max])
+
+    # Anotar discretamente los puntos que fueron llevados al borde de la escala.
+    extremes = plot_df[plot_df["fuera_escala"]]
+    for _, r in extremes.iterrows():
+        direction = "↑" if r["valor_real"] > visual_max else "↓"
+        fig.add_annotation(
+            x=r["fecha_plot"],
+            y=r["valor_plot"],
+            text=f"{direction} {r['valor_real']:.4f}",
+            showarrow=False,
+            yshift=16 if direction == "↑" else -16,
+            font=dict(size=10, color="#b4233a"),
+            bgcolor="rgba(255,255,255,0.88)",
+        )
+
+    fig.update_layout(
+        height=520,
+        margin=dict(l=30, r=90, t=28, b=48),
+        hovermode="closest",
+        showlegend=False,
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#14213d", family="Arial"),
+    )
+    fig.update_xaxes(
+        title_text="Fecha",
+        gridcolor="#edf1f6",
+        zeroline=False,
+        tickfont=dict(color="#6d7890"),
+        title_font=dict(color="#6d7890"),
+        tickformat="%d-%m-%Y",
+    )
+    fig.update_yaxes(
+        title_text=unit,
+        gridcolor="#edf1f6",
+        zeroline=False,
+        tickfont=dict(color="#6d7890"),
+        title_font=dict(color="#6d7890"),
+    )
+
     return fig
 
 
