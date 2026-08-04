@@ -1905,7 +1905,7 @@ def _cached_pdf_bytes(
     analyte = dict(analyte_items)
     lot = dict(lot_items)
     stats = dict(stats_items)
-    results = pd.DataFrame(list(result_records))
+    results = pd.DataFrame([dict(record) for record in result_records])
     return _generate_pdf_uncached(analyte, lot, results, stats).getvalue()
 
 
