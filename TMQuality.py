@@ -74,7 +74,7 @@ LOGO_ICON_B64 = _asset_b64("tmquality_logo_icon.png")
 
 
 
-APP_VERSION = "5.6.9"
+APP_VERSION = "5.7.0"
 PBKDF2_ITERATIONS = 260_000
 LEGACY_PBKDF2_ITERATIONS = 100_000
 ROLES = ["Administrador", "Supervisor", "Operador"]
@@ -2134,134 +2134,225 @@ def module_dashboard(conn, analyte, lot, results):
     if not analyte or not lot:
         st.info("Crea un analito y un lote para comenzar.")
         return
+
     stats = result_summary(
-        conn,
-        int(lot["id"]),
-        float(lot["media_objetivo"]),
-        analyte.get("error_total_permitido"),
+        conn, int(lot["id"]), float(lot["media_objetivo"]),
+        analyte.get("error_total_permitido")
     )
     total_results = int(stats["n"])
     accepted = int(stats["accepted"])
     warn = int(stats["warnings"])
     reject = int(stats["rejected"])
     conform = accepted / total_results * 100 if total_results else 0
-    state = "EN CONTROL" if reject == 0 and warn == 0 and total_results else ("SIN DATOS" if not total_results else "REVISAR LOTE")
-    state_cls = "good" if state == "EN CONTROL" else ("" if state == "SIN DATOS" else "bad")
+
+    if not total_results:
+        state, state_cls = "SIN DATOS", ""
+    elif reject:
+        state, state_cls = "REVISAR LOTE", "bad"
+    elif warn:
+        state, state_cls = "EN ADVERTENCIA", ""
+    else:
+        state, state_cls = "EN CONTROL", "good"
+
+    level_name = str(lot.get("nivel") or "—")
+    level_display = level_name if level_name.lower().startswith("nivel") else f"Nivel {level_name}"
+
+    latest = None
+    if results is not None and not results.empty:
+        recent_sorted = results.copy()
+        recent_sorted["fecha_sort"] = pd.to_datetime(recent_sorted["fecha"], errors="coerce")
+        sort_cols = ["fecha_sort"]
+        if "hora" in recent_sorted.columns:
+            sort_cols.append("hora")
+        if "id" in recent_sorted.columns:
+            sort_cols.append("id")
+        latest = recent_sorted.sort_values(sort_cols).iloc[-1]
+
+    expiry_value, expiry_hint, expiry_kind = "—", "Sin fecha de vencimiento", "info"
+    if lot.get("fecha_vencimiento"):
+        try:
+            expiry_date = pd.to_datetime(lot["fecha_vencimiento"]).date()
+            days_left = (expiry_date - date.today()).days
+            expiry_value = expiry_date.strftime("%d-%m-%Y")
+            if days_left < 0:
+                expiry_hint, expiry_kind = f"Vencido hace {abs(days_left)} día(s)", "bad"
+            elif days_left == 0:
+                expiry_hint, expiry_kind = "Vence hoy", "bad"
+            elif days_left <= 30:
+                expiry_hint, expiry_kind = f"Vence en {days_left} día(s)", "warn"
+            else:
+                expiry_hint, expiry_kind = f"{days_left} días restantes", "good"
+        except Exception:
+            pass
 
     st.markdown('<div class="tmq-section">Resumen del lote</div>', unsafe_allow_html=True)
-    a,b,c = st.columns([1.15,1,1])
-    with a:
-        st.markdown(f'''<div class="tmq-status {state_cls}"><div class="eyebrow">Estado del lote</div><div class="big">{state}</div><div class="small">{analyte['nombre']} · {lot['nivel']} · {lot['lote']}</div></div>''', unsafe_allow_html=True)
-    with b: kpi("Conformidad", f"{conform:.1f}%", f"{accepted} de {total_results} aceptados", "good" if conform >= 90 else "warn")
-    with c: kpi("Resultados", str(total_results), f"{reject} rechazo(s) · {warn} advertencia(s)", "bad" if reject else "info")
+    a, b, c, d = st.columns([1.25, 1, 1, 1])
 
-    # ------------------------------------------------------------------
-    # Alerta accionable cuando el lote requiere revisión
-    # ------------------------------------------------------------------
-    if state == "REVISAR LOTE":
+    with a:
+        st.markdown(
+            f"<div class='tmq-status {state_cls}'><div class='eyebrow'>Estado del lote</div>"
+            f"<div class='big'>{state}</div>"
+            f"<div class='small'>{analyte['nombre']} · {level_display} · Lote {lot['lote']}</div></div>",
+            unsafe_allow_html=True,
+        )
+
+    with b:
+        if latest is None:
+            kpi("Último resultado", "—", "Aún no hay resultados", "info")
+        else:
+            latest_state = str(latest.get("estado") or "Pendiente")
+            latest_rules = str(latest.get("reglas_violadas") or "").strip() or "Sin reglas infringidas"
+            latest_date = pd.to_datetime(latest.get("fecha"), errors="coerce")
+            date_txt = latest_date.strftime("%d-%m-%Y") if not pd.isna(latest_date) else "—"
+            kind = "bad" if latest_state == "Rechazado" else "warn" if latest_state == "Advertencia" else "good"
+            kpi("Último resultado", f"{float(latest['valor']):.4f}",
+                f"{date_txt} · {latest_state} · {latest_rules}", kind)
+
+    with c:
+        kpi("Conformidad", f"{conform:.1f}%",
+            f"{accepted} aceptado(s) · {warn} advertencia(s) · {reject} rechazo(s)",
+            "good" if conform >= 90 and reject == 0 else "warn" if reject == 0 else "bad")
+
+    with d:
+        kpi("Vencimiento", expiry_value, expiry_hint, expiry_kind)
+
+    if state in ("REVISAR LOTE", "EN ADVERTENCIA"):
         reasons = []
         if reject:
             reasons.append(f"{reject} resultado(s) rechazado(s)")
         if warn:
             reasons.append(f"{warn} advertencia(s)")
-        reason_text = " · ".join(reasons) if reasons else "Se detectaron resultados que requieren revisión."
+        reason_text = " · ".join(reasons)
+        if reject:
+            st.error(f"Este lote requiere revisión: {reason_text}. Revisa la secuencia y las reglas infringidas.")
+        else:
+            st.warning(f"Este lote presenta advertencias: {reason_text}. Revisa la secuencia y las reglas infringidas.")
 
-        st.markdown(
-            f"""
-            <div style="
-                display:flex; align-items:flex-start; gap:14px;
-                padding:16px 18px; margin:10px 0 14px 0;
-                background:#FFF4CC; border:1px solid #E8C34A;
-                border-left:5px solid #C98A00; border-radius:12px;
-                color:#3F3100 !important;">
-                <div style="
-                    min-width:28px; width:28px; height:28px;
-                    display:flex; align-items:center; justify-content:center;
-                    border-radius:50%; background:#C98A00;
-                    color:#FFFFFF !important; font-weight:800;">!</div>
-                <div>
-                    <div style="
-                        color:#493600 !important; font-size:15px;
-                        font-weight:800; margin-bottom:3px;">
-                        Este lote requiere revisión
-                    </div>
-                    <div style="
-                        color:#5C4707 !important; font-size:14px;
-                        font-weight:550; line-height:1.5;">
-                        {reason_text}. Revisa la secuencia antes de aceptar nuevas corridas de control.
-                    </div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+    act1, act2, act3 = st.columns(3)
+    with act1:
+        if st.button("Ver resultados críticos", use_container_width=True,
+                     key=f"review_results_{int(lot['id'])}", disabled=(warn + reject == 0)):
+            st.session_state.pending_nav = "Resultados"
+            st.rerun()
+
+    with act2:
+        if st.button("↻ Recalcular lote", use_container_width=True,
+                     key=f"review_recalc_{int(lot['id'])}", disabled=(total_results == 0)):
+            try:
+                n_updated = recalcular_reglas_lote(
+                    conn, int(lot["id"]), float(lot["media_objetivo"]), float(lot["de_objetivo"])
+                )
+                audit(conn, "LOTE_RECALCULADO", "resultados_cc", int(lot["id"]),
+                      f"Reevaluación cronológica de {n_updated} resultado(s)")
+                st.success(f"Se recalcularon {n_updated} resultado(s).")
+                st.rerun()
+            except Exception as exc:
+                conn.rollback()
+                st.error(f"No fue posible recalcular el lote: {exc}")
+
+    with act3:
+        user = st.session_state.get("user")
+        if user and user["rol"] == "Administrador":
+            if st.button("＋ Crear nuevo lote", use_container_width=True,
+                         key=f"review_new_lot_{int(lot['id'])}"):
+                st.session_state.new_lot_analyte_id = int(analyte["id"])
+                st.session_state.pending_nav = "Lotes de control"
+                st.rerun()
+        else:
+            st.button("＋ Crear nuevo lote", use_container_width=True,
+                      key=f"review_new_lot_disabled_{int(lot['id'])}", disabled=True)
+
+    st.markdown('<div class="tmq-section">Control de calidad reciente</div>', unsafe_allow_html=True)
+    if results is None or results.empty:
+        st.info("Aún no hay resultados para visualizar.")
+    else:
+        recent_chart = results.tail(30).copy()
+        st.caption("Últimos 30 resultados. Pasa el cursor sobre un punto para ver estado y reglas infringidas.")
+        st.plotly_chart(
+            levey_jennings_figure(recent_chart, lot["media_objetivo"], lot["de_objetivo"], analyte["unidad"]),
+            use_container_width=True, theme=None,
+            config={"displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "select2d"]}
         )
 
-        act1, act2, act3 = st.columns(3)
+    st.markdown('<div class="tmq-section">Requiere atención</div>', unsafe_allow_html=True)
+    if results is None or results.empty:
+        st.caption("No hay resultados registrados.")
+    else:
+        attention = results[results["estado"].isin(["Advertencia", "Rechazado"])].copy()
+        if attention.empty:
+            st.success("No hay resultados con advertencias o rechazos en el lote seleccionado.")
+        else:
+            attention["fecha"] = pd.to_datetime(attention["fecha"], errors="coerce")
+            sort_cols = ["fecha"] + (["id"] if "id" in attention.columns else [])
+            attention = attention.sort_values(sort_cols, ascending=False).head(6)
+            cols = [x for x in ["fecha","valor","z_score","estado","reglas_violadas","operador"] if x in attention.columns]
+            view = attention[cols].copy()
+            view["fecha"] = view["fecha"].dt.strftime("%d-%m-%Y")
+            view = view.rename(columns={
+                "fecha":"Fecha", "valor":f"Resultado ({analyte['unidad']})",
+                "z_score":"z-score", "estado":"Estado",
+                "reglas_violadas":"Regla(s) infringida(s)", "operador":"Operador"
+            })
+            st.dataframe(view, use_container_width=True, hide_index=True)
 
-        with act1:
-            if st.button(
-                "Ver resultados críticos",
-                use_container_width=True,
-                key=f"review_results_{int(lot['id'])}",
-            ):
-                st.session_state.pending_nav = "Resultados"
-                st.rerun()
+    st.markdown('<div class="tmq-section">Verificación del lote</div>', unsafe_allow_html=True)
+    if results is None or results.empty:
+        st.caption("La verificación estará disponible cuando existan resultados.")
+    else:
+        check_df = results.copy()
+        check_df["fecha_sort"] = pd.to_datetime(check_df["fecha"], errors="coerce")
+        sort_cols = ["fecha_sort"]
+        if "hora" in check_df.columns:
+            sort_cols.append("hora")
+        if "id" in check_df.columns:
+            sort_cols.append("id")
+        check_df = check_df.sort_values(sort_cols)
 
-        with act2:
-            if st.button(
-                "↻ Recalcular lote",
-                use_container_width=True,
-                key=f"review_recalc_{int(lot['id'])}",
-            ):
-                try:
-                    n_updated = recalcular_reglas_lote(
-                        conn,
-                        int(lot["id"]),
-                        float(lot["media_objetivo"]),
-                        float(lot["de_objetivo"]),
-                    )
-                    audit(
-                        conn,
-                        "LOTE_RECALCULADO",
-                        "resultados_cc",
-                        int(lot["id"]),
-                        f"Reevaluación cronológica de {n_updated} resultado(s)",
-                    )
-                    st.success(f"Se recalcularon {n_updated} resultado(s).")
-                    st.rerun()
-                except Exception as exc:
-                    conn.rollback()
-                    st.error(f"No fue posible recalcular el lote: {exc}")
+        previous_z, mismatches = [], []
+        for _, r in check_df.iterrows():
+            current_z = zscore(float(r["valor"]), float(lot["media_objetivo"]), float(lot["de_objetivo"]))
+            rules_now = westgard_rules(previous_z + [current_z])
+            state_now = state_from_rules(rules_now)
+            stored_state = str(r.get("estado") or "")
+            stored_rules = str(r.get("reglas_violadas") or "").strip()
+            stored_set = {x.strip() for x in stored_rules.split(",") if x.strip()}
+            current_set = {str(x).strip() for x in rules_now if str(x).strip()}
 
-        with act3:
-            if user := st.session_state.get("user"):
-                if user["rol"] == "Administrador":
-                    if st.button(
-                        "＋ Crear nuevo lote",
-                        use_container_width=True,
-                        key=f"review_new_lot_{int(lot['id'])}",
-                    ):
-                        st.session_state.new_lot_analyte_id = int(analyte["id"])
-                        st.session_state.pending_nav = "Lotes de control"
-                        st.rerun()
-                else:
-                    st.caption("Solicita a un Administrador la creación de un nuevo lote.")
+            if stored_state != state_now or stored_set != current_set:
+                fdate = pd.to_datetime(r.get("fecha"), errors="coerce")
+                mismatches.append({
+                    "ID": int(r["id"]) if "id" in r and pd.notna(r["id"]) else "—",
+                    "Fecha": fdate.strftime("%d-%m-%Y") if not pd.isna(fdate) else "—",
+                    "Estado guardado": stored_state or "—",
+                    "Estado recalculado": state_now,
+                    "Reglas guardadas": stored_rules or "Ninguna",
+                    "Reglas recalculadas": ", ".join(rules_now) if rules_now else "Ninguna",
+                })
+            previous_z.append(current_z)
 
-    st.markdown('<div class="tmq-section">Control de calidad</div>', unsafe_allow_html=True)
-    st.plotly_chart(levey_jennings_figure(results, lot["media_objetivo"], lot["de_objetivo"], analyte["unidad"]), use_container_width=True, theme=None, config={"displaylogo": False, "modeBarButtonsToRemove":["lasso2d","select2d"]})
+        if mismatches:
+            st.warning(f"Se encontraron {len(mismatches)} resultado(s) con diferencias entre lo guardado y el recálculo actual.")
+            st.dataframe(pd.DataFrame(mismatches), use_container_width=True, hide_index=True)
+        else:
+            st.success("La clasificación almacenada coincide con el recálculo de la secuencia actual.")
+
+        st.caption(
+            "Esta comprobación verifica consistencia interna usando la implementación actual. "
+            "Para validar técnicamente cada criterio Westgard también debe revisarse services.py."
+        )
 
     st.markdown('<div class="tmq-section">Indicadores analíticos</div>', unsafe_allow_html=True)
     c1,c2,c3,c4 = st.columns(4)
-    with c1: kpi("CV", f"{stats['cv']:.2f}%" if stats['cv'] is not None else "—", "Imprecisión observada", "info")
-    with c2: kpi("Sesgo", f"{stats['bias']:+.2f}%" if stats['bias'] is not None else "—", "Respecto de la media objetivo", "info")
-    with c3: kpi("Sigma", f"{stats['sigma']:.2f} σ" if stats['sigma'] is not None else "—", "Requiere ET permitido", "good" if stats['sigma'] is not None and stats['sigma'] >= 4 else "info")
-    with c4: kpi("Alertas", str(warn + reject), "Resultados que requieren atención", "bad" if reject else "warn" if warn else "good")
-
-    if not results.empty:
-        st.markdown('<div class="tmq-section">Actividad reciente</div>', unsafe_allow_html=True)
-        recent = results.tail(8).copy()
-        show = [c for c in ["fecha","turno","operador","equipo_nombre","valor","z_score","estado","reglas_violadas"] if c in recent.columns]
-        st.dataframe(recent[show].sort_values(["fecha"], ascending=False), use_container_width=True, hide_index=True)
+    with c1:
+        kpi("CV", f"{stats['cv']:.2f}%" if stats['cv'] is not None else "—", "Imprecisión observada", "info")
+    with c2:
+        kpi("Sesgo", f"{stats['bias']:+.2f}%" if stats['bias'] is not None else "—", "Respecto de la media objetivo", "info")
+    with c3:
+        kpi("Sigma", f"{stats['sigma']:.2f} σ" if stats['sigma'] is not None else "—",
+            "Requiere ET permitido", "good" if stats['sigma'] is not None and stats['sigma'] >= 4 else "info")
+    with c4:
+        kpi("Alertas", str(warn + reject), "Resultados que requieren atención",
+            "bad" if reject else "warn" if warn else "good")
 
 
 def module_register(conn, user, analyte, lot, results):
