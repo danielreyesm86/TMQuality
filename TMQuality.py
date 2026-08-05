@@ -74,7 +74,7 @@ LOGO_ICON_B64 = _asset_b64("tmquality_logo_icon.png")
 
 
 
-APP_VERSION = "5.7.0"
+APP_VERSION = "5.6.7"
 PBKDF2_ITERATIONS = 260_000
 LEGACY_PBKDF2_ITERATIONS = 100_000
 ROLES = ["Administrador", "Supervisor", "Operador"]
@@ -1465,245 +1465,26 @@ def list_audit(conn, limit=1000):
 # GRÁFICOS Y PDF
 # -----------------------------------------------------------------------------
 def levey_jennings_figure(df: pd.DataFrame, mean: float, sd: float, unit: str):
-    """Gráfico Levey–Jennings único, legible y con reglas Westgard en el hover.
+    """Levey–Jennings optimizado para navegación fluida.
 
-    Los valores extremadamente alejados no deforman la escala del gráfico:
-    se representan en el borde superior/inferior como puntos fuera de escala,
-    conservando en el hover su valor real y las reglas infringidas.
+    Los cálculos estadísticos usan el conjunto completo; el navegador renderiza
+    como máximo los 300 puntos más recientes para evitar gráficos pesados.
     """
     df = df.tail(300).copy()
-    mean = float(mean)
-    sd = float(sd)
-
     fig = go.Figure()
-
-    if df.empty:
-        fig.update_layout(
-            height=500,
-            margin=dict(l=30, r=90, t=30, b=48),
-            xaxis_title="Fecha",
-            yaxis_title=unit,
-            paper_bgcolor="#ffffff",
-            plot_bgcolor="#ffffff",
-            font=dict(color="#14213d", family="Arial"),
-            showlegend=False,
-        )
-        return fig
-
-    plot_df = df.copy()
-    plot_df["fecha_plot"] = pd.to_datetime(plot_df["fecha"], errors="coerce")
-    plot_df["valor_real"] = pd.to_numeric(plot_df["valor"], errors="coerce")
-    plot_df = plot_df.dropna(subset=["fecha_plot", "valor_real"]).copy()
-
-    # Separar levemente resultados registrados el mismo día para evitar líneas verticales.
-    if not plot_df.empty:
-        duplicate_idx = plot_df.groupby("fecha_plot").cumcount()
-        duplicate_count = plot_df.groupby("fecha_plot")["fecha_plot"].transform("size")
-        offset_minutes = duplicate_idx - (duplicate_count - 1) / 2
-        plot_df["fecha_plot"] = plot_df["fecha_plot"] + pd.to_timedelta(
-            offset_minutes * 18, unit="m"
-        )
-
-    # Reglas Westgard para mostrar en el hover.
-    if "reglas_violadas" in plot_df.columns:
-        plot_df["reglas_hover"] = (
-            plot_df["reglas_violadas"]
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            .replace({"": "Ninguna", "None": "Ninguna", "nan": "Ninguna"})
-        )
-    else:
-        plot_df["reglas_hover"] = "Ninguna"
-
-    if "estado" not in plot_df.columns:
-        plot_df["estado"] = "Pendiente"
-
-    status_colors = {
-        "Aceptado": "#0da778",
-        "Advertencia": "#d99113",
-        "Rechazado": "#ef334e",
-        "Pendiente": "#1769d2",
-    }
-    plot_df["color"] = plot_df["estado"].map(status_colors).fillna("#1769d2")
-
-    # Rango visual fijo alrededor de la zona útil de control.
-    # Los valores extremos se muestran en el borde, pero su valor real permanece en hover.
-    if sd > 0:
-        visual_pad = max(sd * 0.55, abs(mean) * 0.015, 1e-6)
-        visual_min = mean - 3 * sd - visual_pad
-        visual_max = mean + 3 * sd + visual_pad
-
-        plot_df["fuera_escala"] = (
-            (plot_df["valor_real"] < visual_min)
-            | (plot_df["valor_real"] > visual_max)
-        )
-
-        cap_margin = max(sd * 0.18, visual_pad * 0.35, 1e-6)
-        plot_df["valor_plot"] = plot_df["valor_real"].clip(
-            lower=visual_min + cap_margin,
-            upper=visual_max - cap_margin,
-        )
-
-        plot_df["nota_escala"] = plot_df["fuera_escala"].map(
-            {True: "Fuera de escala visual", False: "Dentro de escala"}
-        )
-    else:
-        visual_min = float(plot_df["valor_real"].min())
-        visual_max = float(plot_df["valor_real"].max())
-        if visual_min == visual_max:
-            visual_min -= 1
-            visual_max += 1
-        plot_df["fuera_escala"] = False
-        plot_df["valor_plot"] = plot_df["valor_real"]
-        plot_df["nota_escala"] = "Dentro de escala"
-
-    # Línea de tendencia: no unir resultados rechazados ni puntos fuera de escala.
-    trend_y = plot_df["valor_plot"].where(
-        (plot_df["estado"] != "Rechazado") & (~plot_df["fuera_escala"])
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=plot_df["fecha_plot"],
-            y=trend_y,
-            mode="lines",
-            line=dict(width=2.1, color="#1769d2"),
-            hoverinfo="skip",
-            connectgaps=False,
-            showlegend=False,
-            name="Tendencia",
-        )
-    )
-
-    # Símbolo especial para puntos fuera de escala.
-    symbols = [
-        "triangle-up" if outside and real > visual_max
-        else "triangle-down" if outside
-        else "circle"
-        for outside, real in zip(plot_df["fuera_escala"], plot_df["valor_real"])
-    ]
-    sizes = [12 if outside else 9 for outside in plot_df["fuera_escala"]]
-
-    customdata = plot_df[
-        ["estado", "reglas_hover", "valor_real", "nota_escala"]
-    ].to_numpy()
-
-    fig.add_trace(
-        go.Scatter(
-            x=plot_df["fecha_plot"],
-            y=plot_df["valor_plot"],
-            mode="markers",
-            marker=dict(
-                size=sizes,
-                symbol=symbols,
-                color=plot_df["color"],
-                line=dict(width=1.5, color="#ffffff"),
-            ),
-            customdata=customdata,
-            hovertemplate=(
-                "<b>%{x|%d-%m-%Y}</b><br>"
-                "Resultado: <b>%{customdata[2]:.4f} " + unit + "</b><br>"
-                "Estado: %{customdata[0]}<br>"
-                "Regla(s) infringida(s): <b>%{customdata[1]}</b><br>"
-                "%{customdata[3]}"
-                "<extra></extra>"
-            ),
-            showlegend=False,
-            name="Resultado",
-        )
-    )
-
-    if sd > 0:
-        # Bandas visuales de control.
-        bands = [
-            (-3, -2, "rgba(239,51,78,0.055)"),
-            (-2, -1, "rgba(217,145,19,0.055)"),
-            (-1,  1, "rgba(13,167,120,0.045)"),
-            ( 1,  2, "rgba(217,145,19,0.055)"),
-            ( 2,  3, "rgba(239,51,78,0.055)"),
-        ]
-        for low_mult, high_mult, fill in bands:
-            fig.add_hrect(
-                y0=mean + low_mult * sd,
-                y1=mean + high_mult * sd,
-                fillcolor=fill,
-                line_width=0,
-                layer="below",
-            )
-
-        levels = [
-            (0,  "Media", "solid", "#13233f", 2.1),
-            (1,  "+1 DE", "dot",   "#8da0b8", 1.2),
-            (-1, "-1 DE", "dot",   "#8da0b8", 1.2),
-            (2,  "+2 DE", "dash",  "#d99113", 1.4),
-            (-2, "-2 DE", "dash",  "#d99113", 1.4),
-            (3,  "+3 DE", "solid", "#ef334e", 1.5),
-            (-3, "-3 DE", "solid", "#ef334e", 1.5),
-        ]
-
-        for mult, label, dash, color, width in levels:
-            y_ref = mean + mult * sd
-            fig.add_hline(
-                y=y_ref,
-                line_dash=dash,
-                line_color=color,
-                line_width=width,
-            )
-            fig.add_annotation(
-                x=1.006,
-                xref="paper",
-                y=y_ref,
-                yref="y",
-                text=label,
-                showarrow=False,
-                xanchor="left",
-                yanchor="middle",
-                font=dict(size=11, color=color),
-                bgcolor="rgba(255,255,255,0.82)",
-                borderpad=2,
-            )
-
-        fig.update_yaxes(range=[visual_min, visual_max])
-
-    # Anotar discretamente los puntos que fueron llevados al borde de la escala.
-    extremes = plot_df[plot_df["fuera_escala"]]
-    for _, r in extremes.iterrows():
-        direction = "↑" if r["valor_real"] > visual_max else "↓"
-        fig.add_annotation(
-            x=r["fecha_plot"],
-            y=r["valor_plot"],
-            text=f"{direction} {r['valor_real']:.4f}",
-            showarrow=False,
-            yshift=16 if direction == "↑" else -16,
-            font=dict(size=10, color="#b4233a"),
-            bgcolor="rgba(255,255,255,0.88)",
-        )
-
-    fig.update_layout(
-        height=520,
-        margin=dict(l=30, r=90, t=28, b=48),
-        hovermode="closest",
-        showlegend=False,
-        paper_bgcolor="#ffffff",
-        plot_bgcolor="#ffffff",
-        font=dict(color="#14213d", family="Arial"),
-    )
-    fig.update_xaxes(
-        title_text="Fecha",
-        gridcolor="#edf1f6",
-        zeroline=False,
-        tickfont=dict(color="#6d7890"),
-        title_font=dict(color="#6d7890"),
-        tickformat="%d-%m-%Y",
-    )
-    fig.update_yaxes(
-        title_text=unit,
-        gridcolor="#edf1f6",
-        zeroline=False,
-        tickfont=dict(color="#6d7890"),
-        title_font=dict(color="#6d7890"),
-    )
-
+    if not df.empty:
+        x = pd.to_datetime(df["fecha"]).dt.strftime("%d-%m-%Y")
+        colors_pts = ["#0da778" if s == "Aceptado" else "#d99113" if s == "Advertencia" else "#ef334e" if s == "Rechazado" else "#1769d2" for s in df["estado"]]
+        fig.add_trace(go.Scatter(x=x, y=df["valor"], mode="lines+markers", name="Resultado",
+            line=dict(width=2.6, color="#1769d2"), marker=dict(size=8, color=colors_pts, line=dict(width=1.5,color="#ffffff")),
+            hovertemplate="%{x}<br><b>%{y:.4f} " + unit + "</b><extra></extra>"))
+    levels=[(0,"Media","solid","#13233f",2.2),(1,"+1 DE","dot","#8da0b8",1.3),(-1,"-1 DE","dot","#8da0b8",1.3),(2,"+2 DE","dash","#d99113",1.5),(-2,"-2 DE","dash","#d99113",1.5),(3,"+3 DE","solid","#ef334e",1.6),(-3,"-3 DE","solid","#ef334e",1.6)]
+    for mult,label,dash,color,width in levels:
+        fig.add_hline(y=mean+mult*sd,line_dash=dash,line_color=color,line_width=width,annotation_text=label,annotation_position="right",annotation_font_color="#6d7890")
+    fig.update_layout(height=455,margin=dict(l=22,r=62,t=24,b=18),xaxis_title="Fecha",yaxis_title=unit,hovermode="x unified",showlegend=False,
+        paper_bgcolor="#ffffff",plot_bgcolor="#ffffff",font=dict(color="#14213d",family="Arial"),
+        xaxis=dict(gridcolor="#edf1f6",zeroline=False,tickfont=dict(color="#6d7890"),title_font=dict(color="#6d7890")),
+        yaxis=dict(gridcolor="#edf1f6",zeroline=False,tickfont=dict(color="#6d7890"),title_font=dict(color="#6d7890")))
     return fig
 
 
@@ -1905,7 +1686,7 @@ def _cached_pdf_bytes(
     analyte = dict(analyte_items)
     lot = dict(lot_items)
     stats = dict(stats_items)
-    results = pd.DataFrame([dict(record) for record in result_records])
+    results = pd.DataFrame(list(result_records))
     return _generate_pdf_uncached(analyte, lot, results, stats).getvalue()
 
 
@@ -2134,225 +1915,134 @@ def module_dashboard(conn, analyte, lot, results):
     if not analyte or not lot:
         st.info("Crea un analito y un lote para comenzar.")
         return
-
     stats = result_summary(
-        conn, int(lot["id"]), float(lot["media_objetivo"]),
-        analyte.get("error_total_permitido")
+        conn,
+        int(lot["id"]),
+        float(lot["media_objetivo"]),
+        analyte.get("error_total_permitido"),
     )
     total_results = int(stats["n"])
     accepted = int(stats["accepted"])
     warn = int(stats["warnings"])
     reject = int(stats["rejected"])
     conform = accepted / total_results * 100 if total_results else 0
-
-    if not total_results:
-        state, state_cls = "SIN DATOS", ""
-    elif reject:
-        state, state_cls = "REVISAR LOTE", "bad"
-    elif warn:
-        state, state_cls = "EN ADVERTENCIA", ""
-    else:
-        state, state_cls = "EN CONTROL", "good"
-
-    level_name = str(lot.get("nivel") or "—")
-    level_display = level_name if level_name.lower().startswith("nivel") else f"Nivel {level_name}"
-
-    latest = None
-    if results is not None and not results.empty:
-        recent_sorted = results.copy()
-        recent_sorted["fecha_sort"] = pd.to_datetime(recent_sorted["fecha"], errors="coerce")
-        sort_cols = ["fecha_sort"]
-        if "hora" in recent_sorted.columns:
-            sort_cols.append("hora")
-        if "id" in recent_sorted.columns:
-            sort_cols.append("id")
-        latest = recent_sorted.sort_values(sort_cols).iloc[-1]
-
-    expiry_value, expiry_hint, expiry_kind = "—", "Sin fecha de vencimiento", "info"
-    if lot.get("fecha_vencimiento"):
-        try:
-            expiry_date = pd.to_datetime(lot["fecha_vencimiento"]).date()
-            days_left = (expiry_date - date.today()).days
-            expiry_value = expiry_date.strftime("%d-%m-%Y")
-            if days_left < 0:
-                expiry_hint, expiry_kind = f"Vencido hace {abs(days_left)} día(s)", "bad"
-            elif days_left == 0:
-                expiry_hint, expiry_kind = "Vence hoy", "bad"
-            elif days_left <= 30:
-                expiry_hint, expiry_kind = f"Vence en {days_left} día(s)", "warn"
-            else:
-                expiry_hint, expiry_kind = f"{days_left} días restantes", "good"
-        except Exception:
-            pass
+    state = "EN CONTROL" if reject == 0 and warn == 0 and total_results else ("SIN DATOS" if not total_results else "REVISAR LOTE")
+    state_cls = "good" if state == "EN CONTROL" else ("" if state == "SIN DATOS" else "bad")
 
     st.markdown('<div class="tmq-section">Resumen del lote</div>', unsafe_allow_html=True)
-    a, b, c, d = st.columns([1.25, 1, 1, 1])
-
+    a,b,c = st.columns([1.15,1,1])
     with a:
-        st.markdown(
-            f"<div class='tmq-status {state_cls}'><div class='eyebrow'>Estado del lote</div>"
-            f"<div class='big'>{state}</div>"
-            f"<div class='small'>{analyte['nombre']} · {level_display} · Lote {lot['lote']}</div></div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'''<div class="tmq-status {state_cls}"><div class="eyebrow">Estado del lote</div><div class="big">{state}</div><div class="small">{analyte['nombre']} · {lot['nivel']} · {lot['lote']}</div></div>''', unsafe_allow_html=True)
+    with b: kpi("Conformidad", f"{conform:.1f}%", f"{accepted} de {total_results} aceptados", "good" if conform >= 90 else "warn")
+    with c: kpi("Resultados", str(total_results), f"{reject} rechazo(s) · {warn} advertencia(s)", "bad" if reject else "info")
 
-    with b:
-        if latest is None:
-            kpi("Último resultado", "—", "Aún no hay resultados", "info")
-        else:
-            latest_state = str(latest.get("estado") or "Pendiente")
-            latest_rules = str(latest.get("reglas_violadas") or "").strip() or "Sin reglas infringidas"
-            latest_date = pd.to_datetime(latest.get("fecha"), errors="coerce")
-            date_txt = latest_date.strftime("%d-%m-%Y") if not pd.isna(latest_date) else "—"
-            kind = "bad" if latest_state == "Rechazado" else "warn" if latest_state == "Advertencia" else "good"
-            kpi("Último resultado", f"{float(latest['valor']):.4f}",
-                f"{date_txt} · {latest_state} · {latest_rules}", kind)
-
-    with c:
-        kpi("Conformidad", f"{conform:.1f}%",
-            f"{accepted} aceptado(s) · {warn} advertencia(s) · {reject} rechazo(s)",
-            "good" if conform >= 90 and reject == 0 else "warn" if reject == 0 else "bad")
-
-    with d:
-        kpi("Vencimiento", expiry_value, expiry_hint, expiry_kind)
-
-    if state in ("REVISAR LOTE", "EN ADVERTENCIA"):
+    # ------------------------------------------------------------------
+    # Alerta accionable cuando el lote requiere revisión
+    # ------------------------------------------------------------------
+    if state == "REVISAR LOTE":
         reasons = []
         if reject:
             reasons.append(f"{reject} resultado(s) rechazado(s)")
         if warn:
             reasons.append(f"{warn} advertencia(s)")
-        reason_text = " · ".join(reasons)
-        if reject:
-            st.error(f"Este lote requiere revisión: {reason_text}. Revisa la secuencia y las reglas infringidas.")
-        else:
-            st.warning(f"Este lote presenta advertencias: {reason_text}. Revisa la secuencia y las reglas infringidas.")
+        reason_text = " · ".join(reasons) if reasons else "Se detectaron resultados que requieren revisión."
 
-    act1, act2, act3 = st.columns(3)
-    with act1:
-        if st.button("Ver resultados críticos", use_container_width=True,
-                     key=f"review_results_{int(lot['id'])}", disabled=(warn + reject == 0)):
-            st.session_state.pending_nav = "Resultados"
-            st.rerun()
-
-    with act2:
-        if st.button("↻ Recalcular lote", use_container_width=True,
-                     key=f"review_recalc_{int(lot['id'])}", disabled=(total_results == 0)):
-            try:
-                n_updated = recalcular_reglas_lote(
-                    conn, int(lot["id"]), float(lot["media_objetivo"]), float(lot["de_objetivo"])
-                )
-                audit(conn, "LOTE_RECALCULADO", "resultados_cc", int(lot["id"]),
-                      f"Reevaluación cronológica de {n_updated} resultado(s)")
-                st.success(f"Se recalcularon {n_updated} resultado(s).")
-                st.rerun()
-            except Exception as exc:
-                conn.rollback()
-                st.error(f"No fue posible recalcular el lote: {exc}")
-
-    with act3:
-        user = st.session_state.get("user")
-        if user and user["rol"] == "Administrador":
-            if st.button("＋ Crear nuevo lote", use_container_width=True,
-                         key=f"review_new_lot_{int(lot['id'])}"):
-                st.session_state.new_lot_analyte_id = int(analyte["id"])
-                st.session_state.pending_nav = "Lotes de control"
-                st.rerun()
-        else:
-            st.button("＋ Crear nuevo lote", use_container_width=True,
-                      key=f"review_new_lot_disabled_{int(lot['id'])}", disabled=True)
-
-    st.markdown('<div class="tmq-section">Control de calidad reciente</div>', unsafe_allow_html=True)
-    if results is None or results.empty:
-        st.info("Aún no hay resultados para visualizar.")
-    else:
-        recent_chart = results.tail(30).copy()
-        st.caption("Últimos 30 resultados. Pasa el cursor sobre un punto para ver estado y reglas infringidas.")
-        st.plotly_chart(
-            levey_jennings_figure(recent_chart, lot["media_objetivo"], lot["de_objetivo"], analyte["unidad"]),
-            use_container_width=True, theme=None,
-            config={"displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "select2d"]}
+        st.markdown(
+            f"""
+            <div style="
+                display:flex; align-items:flex-start; gap:14px;
+                padding:16px 18px; margin:10px 0 14px 0;
+                background:#FFF4CC; border:1px solid #E8C34A;
+                border-left:5px solid #C98A00; border-radius:12px;
+                color:#3F3100 !important;">
+                <div style="
+                    min-width:28px; width:28px; height:28px;
+                    display:flex; align-items:center; justify-content:center;
+                    border-radius:50%; background:#C98A00;
+                    color:#FFFFFF !important; font-weight:800;">!</div>
+                <div>
+                    <div style="
+                        color:#493600 !important; font-size:15px;
+                        font-weight:800; margin-bottom:3px;">
+                        Este lote requiere revisión
+                    </div>
+                    <div style="
+                        color:#5C4707 !important; font-size:14px;
+                        font-weight:550; line-height:1.5;">
+                        {reason_text}. Revisa la secuencia antes de aceptar nuevas corridas de control.
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-    st.markdown('<div class="tmq-section">Requiere atención</div>', unsafe_allow_html=True)
-    if results is None or results.empty:
-        st.caption("No hay resultados registrados.")
-    else:
-        attention = results[results["estado"].isin(["Advertencia", "Rechazado"])].copy()
-        if attention.empty:
-            st.success("No hay resultados con advertencias o rechazos en el lote seleccionado.")
-        else:
-            attention["fecha"] = pd.to_datetime(attention["fecha"], errors="coerce")
-            sort_cols = ["fecha"] + (["id"] if "id" in attention.columns else [])
-            attention = attention.sort_values(sort_cols, ascending=False).head(6)
-            cols = [x for x in ["fecha","valor","z_score","estado","reglas_violadas","operador"] if x in attention.columns]
-            view = attention[cols].copy()
-            view["fecha"] = view["fecha"].dt.strftime("%d-%m-%Y")
-            view = view.rename(columns={
-                "fecha":"Fecha", "valor":f"Resultado ({analyte['unidad']})",
-                "z_score":"z-score", "estado":"Estado",
-                "reglas_violadas":"Regla(s) infringida(s)", "operador":"Operador"
-            })
-            st.dataframe(view, use_container_width=True, hide_index=True)
+        act1, act2, act3 = st.columns(3)
 
-    st.markdown('<div class="tmq-section">Verificación del lote</div>', unsafe_allow_html=True)
-    if results is None or results.empty:
-        st.caption("La verificación estará disponible cuando existan resultados.")
-    else:
-        check_df = results.copy()
-        check_df["fecha_sort"] = pd.to_datetime(check_df["fecha"], errors="coerce")
-        sort_cols = ["fecha_sort"]
-        if "hora" in check_df.columns:
-            sort_cols.append("hora")
-        if "id" in check_df.columns:
-            sort_cols.append("id")
-        check_df = check_df.sort_values(sort_cols)
+        with act1:
+            if st.button(
+                "Ver resultados críticos",
+                use_container_width=True,
+                key=f"review_results_{int(lot['id'])}",
+            ):
+                st.session_state.pending_nav = "Resultados"
+                st.rerun()
 
-        previous_z, mismatches = [], []
-        for _, r in check_df.iterrows():
-            current_z = zscore(float(r["valor"]), float(lot["media_objetivo"]), float(lot["de_objetivo"]))
-            rules_now = westgard_rules(previous_z + [current_z])
-            state_now = state_from_rules(rules_now)
-            stored_state = str(r.get("estado") or "")
-            stored_rules = str(r.get("reglas_violadas") or "").strip()
-            stored_set = {x.strip() for x in stored_rules.split(",") if x.strip()}
-            current_set = {str(x).strip() for x in rules_now if str(x).strip()}
+        with act2:
+            if st.button(
+                "↻ Recalcular lote",
+                use_container_width=True,
+                key=f"review_recalc_{int(lot['id'])}",
+            ):
+                try:
+                    n_updated = recalcular_reglas_lote(
+                        conn,
+                        int(lot["id"]),
+                        float(lot["media_objetivo"]),
+                        float(lot["de_objetivo"]),
+                    )
+                    audit(
+                        conn,
+                        "LOTE_RECALCULADO",
+                        "resultados_cc",
+                        int(lot["id"]),
+                        f"Reevaluación cronológica de {n_updated} resultado(s)",
+                    )
+                    st.success(f"Se recalcularon {n_updated} resultado(s).")
+                    st.rerun()
+                except Exception as exc:
+                    conn.rollback()
+                    st.error(f"No fue posible recalcular el lote: {exc}")
 
-            if stored_state != state_now or stored_set != current_set:
-                fdate = pd.to_datetime(r.get("fecha"), errors="coerce")
-                mismatches.append({
-                    "ID": int(r["id"]) if "id" in r and pd.notna(r["id"]) else "—",
-                    "Fecha": fdate.strftime("%d-%m-%Y") if not pd.isna(fdate) else "—",
-                    "Estado guardado": stored_state or "—",
-                    "Estado recalculado": state_now,
-                    "Reglas guardadas": stored_rules or "Ninguna",
-                    "Reglas recalculadas": ", ".join(rules_now) if rules_now else "Ninguna",
-                })
-            previous_z.append(current_z)
+        with act3:
+            if user := st.session_state.get("user"):
+                if user["rol"] == "Administrador":
+                    if st.button(
+                        "＋ Crear nuevo lote",
+                        use_container_width=True,
+                        key=f"review_new_lot_{int(lot['id'])}",
+                    ):
+                        st.session_state.new_lot_analyte_id = int(analyte["id"])
+                        st.session_state.pending_nav = "Lotes de control"
+                        st.rerun()
+                else:
+                    st.caption("Solicita a un Administrador la creación de un nuevo lote.")
 
-        if mismatches:
-            st.warning(f"Se encontraron {len(mismatches)} resultado(s) con diferencias entre lo guardado y el recálculo actual.")
-            st.dataframe(pd.DataFrame(mismatches), use_container_width=True, hide_index=True)
-        else:
-            st.success("La clasificación almacenada coincide con el recálculo de la secuencia actual.")
-
-        st.caption(
-            "Esta comprobación verifica consistencia interna usando la implementación actual. "
-            "Para validar técnicamente cada criterio Westgard también debe revisarse services.py."
-        )
+    st.markdown('<div class="tmq-section">Control de calidad</div>', unsafe_allow_html=True)
+    st.plotly_chart(levey_jennings_figure(results, lot["media_objetivo"], lot["de_objetivo"], analyte["unidad"]), use_container_width=True, theme=None, config={"displaylogo": False, "modeBarButtonsToRemove":["lasso2d","select2d"]})
 
     st.markdown('<div class="tmq-section">Indicadores analíticos</div>', unsafe_allow_html=True)
     c1,c2,c3,c4 = st.columns(4)
-    with c1:
-        kpi("CV", f"{stats['cv']:.2f}%" if stats['cv'] is not None else "—", "Imprecisión observada", "info")
-    with c2:
-        kpi("Sesgo", f"{stats['bias']:+.2f}%" if stats['bias'] is not None else "—", "Respecto de la media objetivo", "info")
-    with c3:
-        kpi("Sigma", f"{stats['sigma']:.2f} σ" if stats['sigma'] is not None else "—",
-            "Requiere ET permitido", "good" if stats['sigma'] is not None and stats['sigma'] >= 4 else "info")
-    with c4:
-        kpi("Alertas", str(warn + reject), "Resultados que requieren atención",
-            "bad" if reject else "warn" if warn else "good")
+    with c1: kpi("CV", f"{stats['cv']:.2f}%" if stats['cv'] is not None else "—", "Imprecisión observada", "info")
+    with c2: kpi("Sesgo", f"{stats['bias']:+.2f}%" if stats['bias'] is not None else "—", "Respecto de la media objetivo", "info")
+    with c3: kpi("Sigma", f"{stats['sigma']:.2f} σ" if stats['sigma'] is not None else "—", "Requiere ET permitido", "good" if stats['sigma'] is not None and stats['sigma'] >= 4 else "info")
+    with c4: kpi("Alertas", str(warn + reject), "Resultados que requieren atención", "bad" if reject else "warn" if warn else "good")
+
+    if not results.empty:
+        st.markdown('<div class="tmq-section">Actividad reciente</div>', unsafe_allow_html=True)
+        recent = results.tail(8).copy()
+        show = [c for c in ["fecha","turno","operador","equipo_nombre","valor","z_score","estado","reglas_violadas"] if c in recent.columns]
+        st.dataframe(recent[show].sort_values(["fecha"], ascending=False), use_container_width=True, hide_index=True)
 
 
 def module_register(conn, user, analyte, lot, results):
@@ -2403,78 +2093,6 @@ def module_register(conn, user, analyte, lot, results):
         elif state == "Advertencia": st.warning(f"Advertencia: {', '.join(rules)}")
         else: st.error(f"Resultado rechazado: {', '.join(rules)}")
         st.rerun()
-
-
-
-def delete_qc_result(conn, result_id: int, user: dict, lot: dict) -> int:
-    """Elimina definitivamente un resultado y recalcula cronológicamente el lote.
-
-    Devuelve la cantidad de resultados reevaluados después de la eliminación.
-    La acción queda registrada en auditoría con los datos esenciales del resultado.
-    """
-    org_id = current_org_id(user)
-    row = fetchone(
-        conn,
-        """
-        SELECT r.id, r.lote_control_id, r.fecha, r.turno, r.operador, r.valor,
-               r.z_score, r.estado, r.reglas_violadas, r.comentarios,
-               l.lote, l.nivel, a.nombre AS analito, a.unidad
-        FROM resultados_cc r
-        JOIN lotes_control l
-          ON l.id=r.lote_control_id
-         AND l.organizacion_id=r.organizacion_id
-        JOIN analitos a
-          ON a.id=l.analito_id
-         AND a.organizacion_id=l.organizacion_id
-        WHERE r.id=%s
-          AND r.organizacion_id=%s
-          AND r.lote_control_id=%s
-        """,
-        (int(result_id), org_id, int(lot["id"])),
-    )
-    if not row:
-        raise ValueError("El resultado no existe o no pertenece al lote seleccionado.")
-
-    detail = (
-        f"{row['analito']} · {row['nivel']} · lote {row['lote']} · "
-        f"fecha {row['fecha']} · valor {row['valor']} {row['unidad']} · "
-        f"estado {row['estado']}"
-    )
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                DELETE FROM resultados_cc
-                WHERE id=%s
-                  AND organizacion_id=%s
-                  AND lote_control_id=%s
-                """,
-                (int(result_id), org_id, int(lot["id"])),
-            )
-            if cur.rowcount != 1:
-                raise ValueError("No fue posible identificar un único resultado para eliminar.")
-        conn.commit()
-
-        n_actualizados = recalcular_reglas_lote(
-            conn,
-            int(lot["id"]),
-            float(lot["media_objetivo"]),
-            float(lot["de_objetivo"]),
-        )
-
-        audit(
-            conn,
-            "RESULTADO_ELIMINADO",
-            "resultados_cc",
-            int(result_id),
-            detail + f" · eliminación permanente · {n_actualizados} resultado(s) reevaluados",
-        )
-        return int(n_actualizados)
-
-    except Exception:
-        conn.rollback()
-        raise
 
 
 def module_history(conn, user, analyte, lot, results):
@@ -2545,280 +2163,33 @@ def module_history(conn, user, analyte, lot, results):
         st.success("Revisión guardada.")
         st.rerun()
 
-    if user["rol"] == "Administrador":
-        st.divider()
-        st.markdown("#### Eliminar resultado")
-        st.warning(
-            "La eliminación es permanente y no se puede deshacer. "
-            "Al eliminar un resultado, TMQuality recalculará automáticamente "
-            "las reglas de Westgard de todo el lote porque la secuencia cronológica cambia."
-        )
-
-        result_date = row.get("fecha")
-        result_value = row.get("valor")
-        result_state = row.get("estado") or "—"
-        st.info(
-            f"Resultado seleccionado: ID {int(rid)} · "
-            f"{result_date} · {float(result_value):.4f} {analyte['unidad']} · "
-            f"Estado: {result_state}"
-        )
-
-        confirm_delete = st.checkbox(
-            "Confirmo que revisé el resultado seleccionado y deseo eliminarlo permanentemente.",
-            key=f"confirm_delete_result_{int(rid)}",
-        )
-
-        typed_id = ""
-        if confirm_delete:
-            typed_id = st.text_input(
-                f"Para confirmar, escribe exactamente el ID del resultado: {int(rid)}",
-                key=f"type_delete_result_{int(rid)}",
-            )
-
-        if st.button(
-            "Eliminar resultado definitivamente",
-            type="primary",
-            use_container_width=True,
-            key=f"delete_result_{int(rid)}",
-            disabled=(not confirm_delete or typed_id.strip() != str(int(rid))),
-        ):
-            try:
-                n_actualizados = delete_qc_result(conn, int(rid), user, lot)
-                st.success(
-                    f"Resultado ID {int(rid)} eliminado. "
-                    f"Se reevaluaron {n_actualizados} resultado(s) del lote."
-                )
-                st.rerun()
-            except Exception as exc:
-                conn.rollback()
-                st.error(f"No fue posible eliminar el resultado: {exc}")
-    else:
-        st.caption(
-            "La eliminación permanente de resultados está disponible solo para Administradores."
-        )
-
 
 def module_analytics(conn, analyte, lot, results):
     st.subheader("Analítica de desempeño")
-    st.caption(
-        "Resumen estadístico del lote y evolución de la precisión a través del tiempo."
-    )
-
     if not analyte or not lot or results.empty:
         st.info("Se requieren resultados para calcular indicadores.")
         return
-
-    stats = qc_statistics(
-        results,
-        lot["media_objetivo"],
-        analyte.get("error_total_permitido"),
-    )
-
-    # ------------------------------------------------------------------
-    # Indicadores principales
-    # ------------------------------------------------------------------
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "Media observada",
-        f"{stats['mean']:.4f}" if stats.get("mean") is not None else "—",
-        help="Promedio de los resultados de control registrados para el lote seleccionado.",
-    )
-    c2.metric(
-        "DE observada",
-        f"{stats['sd']:.4f}" if stats.get("sd") is not None else "—",
-        help="Desviación estándar observada de los resultados del lote.",
-    )
-    c3.metric(
-        "CV%",
-        f"{stats['cv']:.2f}%" if stats.get("cv") is not None else "—",
-        help="Coeficiente de variación: DE / media × 100. Resume la imprecisión observada.",
-    )
-    c4.metric(
-        "Sesgo%",
-        f"{stats['bias']:.2f}%" if stats.get("bias") is not None else "—",
-        help="Diferencia porcentual entre la media observada y el valor objetivo del lote.",
-    )
-
-    # Sigma ocupa su propia tarjeta porque depende del Error Total Permitido.
-    st.markdown("##### Métrica Sigma")
-    etp = analyte.get("error_total_permitido")
-    if etp is None:
-        st.info(
-            "Define el Error Total Permitido (%) del analito para calcular la Métrica Sigma."
-        )
+    stats = qc_statistics(results, lot["media_objetivo"], analyte.get("error_total_permitido"))
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Media observada", f"{stats['mean']:.4f}")
+    c2.metric("DE observada", f"{stats['sd']:.4f}")
+    c3.metric("CV%", f"{stats['cv']:.2f}%" if stats['cv'] is not None else "—")
+    c4.metric("Sesgo%", f"{stats['bias']:.2f}%" if stats['bias'] is not None else "—")
+    if analyte.get("error_total_permitido") is None:
+        st.info("Define el Error Total Permitido (%) del analito para calcular Sigma.")
     else:
-        sigma = stats.get("sigma")
-        sigma_col, info_col = st.columns([1, 3])
-
-        with sigma_col:
-            st.metric(
-                "Sigma",
-                f"{sigma:.2f}" if sigma is not None else "—",
-                help="(Error Total Permitido − |sesgo|) / CV",
-            )
-
-        with info_col:
-            if sigma is None:
-                st.caption(
-                    "No es posible calcular Sigma con los resultados disponibles."
-                )
-            elif sigma >= 6:
-                st.success(
-                    "Desempeño Sigma muy alto para los parámetros actualmente configurados."
-                )
-            elif sigma >= 4:
-                st.info(
-                    "Desempeño Sigma intermedio-alto para los parámetros actualmente configurados."
-                )
-            elif sigma >= 3:
-                st.warning(
-                    "Desempeño Sigma moderado. Conviene vigilar la precisión y el sesgo del método."
-                )
-            else:
-                st.error(
-                    "Sigma < 3 con los parámetros actualmente configurados. "
-                    "Revisa precisión, sesgo y Error Total Permitido antes de interpretar el desempeño."
-                )
-
-    st.divider()
-
-    # ------------------------------------------------------------------
-    # Tendencia mensual del CV
-    # ------------------------------------------------------------------
-    st.markdown("##### Tendencia mensual del CV%")
+        sigma = stats["sigma"]
+        st.metric("Métrica Sigma", f"{sigma:.2f}" if sigma is not None else "—", help="(ET permitido − |sesgo|) / CV")
 
     temp = results.copy()
-    temp["fecha"] = pd.to_datetime(temp["fecha"], errors="coerce")
-    temp["valor"] = pd.to_numeric(temp["valor"], errors="coerce")
-    temp = temp.dropna(subset=["fecha", "valor"]).copy()
-
-    if temp.empty:
-        st.info("No hay resultados válidos suficientes para calcular la tendencia mensual.")
-        return
-
-    temp["mes_periodo"] = temp["fecha"].dt.to_period("M")
-
-    monthly = (
-        temp.groupby("mes_periodo")
-        .agg(
-            media=("valor", "mean"),
-            de=("valor", "std"),
-            n=("valor", "count"),
-        )
-        .reset_index()
-        .sort_values("mes_periodo")
-    )
-
-    # El CV mensual requiere al menos 2 resultados dentro del mes para calcular DE.
+    temp["fecha"] = pd.to_datetime(temp["fecha"])
+    temp["mes"] = temp["fecha"].dt.to_period("M").astype(str)
+    monthly = temp.groupby("mes").agg(media=("valor","mean"), de=("valor","std"), n=("valor","count")).reset_index()
     monthly["cv"] = monthly["de"] / monthly["media"] * 100
-    monthly_valid = monthly[
-        (monthly["n"] >= 2)
-        & monthly["cv"].notna()
-        & monthly["cv"].replace([float("inf"), float("-inf")], pd.NA).notna()
-    ].copy()
-
-    month_names = {
-        1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr",
-        5: "May", 6: "Jun", 7: "Jul", 8: "Ago",
-        9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
-    }
-
-    if not monthly_valid.empty:
-        monthly_valid["mes_label"] = monthly_valid["mes_periodo"].apply(
-            lambda p: f"{month_names.get(p.month, p.month)} {p.year}"
-        )
-
-    # Con un solo mes, el gráfico no representa una tendencia real.
-    if len(monthly_valid) < 2:
-        if len(monthly_valid) == 1:
-            only = monthly_valid.iloc[0]
-            st.info(
-                f"Actualmente hay un solo mes con datos suficientes para calcular CV% "
-                f"({only['mes_label']}: {only['cv']:.2f}%, n={int(only['n'])}). "
-                "Se requieren al menos 2 meses con resultados para mostrar una tendencia."
-            )
-        else:
-            st.info(
-                "Se requieren al menos 2 meses con un mínimo de 2 resultados válidos por mes "
-                "para mostrar la tendencia mensual del CV%."
-            )
-        return
-
-    # Gráfico de línea: más adecuado que barras para visualizar tendencia.
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=monthly_valid["mes_label"],
-            y=monthly_valid["cv"],
-            mode="lines+markers",
-            line=dict(width=2.5),
-            marker=dict(size=9),
-            customdata=monthly_valid[["n", "media", "de"]].to_numpy(),
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                "CV: <b>%{y:.2f}%</b><br>"
-                "n: %{customdata[0]:.0f}<br>"
-                "Media: %{customdata[1]:.4f}<br>"
-                "DE: %{customdata[2]:.4f}"
-                "<extra></extra>"
-            ),
-            name="CV%",
-        )
-    )
-
-    fig.update_layout(
-        height=390,
-        margin=dict(l=30, r=25, t=18, b=45),
-        xaxis_title="Mes",
-        yaxis_title="CV%",
-        hovermode="closest",
-        showlegend=False,
-        paper_bgcolor="#ffffff",
-        plot_bgcolor="#ffffff",
-        font=dict(color="#14213d", family="Arial"),
-    )
-    fig.update_xaxes(
-        type="category",
-        categoryorder="array",
-        categoryarray=monthly_valid["mes_label"].tolist(),
-        gridcolor="#edf1f6",
-        tickfont=dict(color="#6d7890"),
-        title_font=dict(color="#6d7890"),
-    )
-    fig.update_yaxes(
-        rangemode="tozero",
-        gridcolor="#edf1f6",
-        zeroline=False,
-        tickfont=dict(color="#6d7890"),
-        title_font=dict(color="#6d7890"),
-        ticksuffix="%",
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        theme=None,
-        config={"displaylogo": False},
-    )
-
-    # Resumen simple de dirección de la tendencia, sin sustituir interpretación clínica.
-    first_cv = float(monthly_valid.iloc[0]["cv"])
-    last_cv = float(monthly_valid.iloc[-1]["cv"])
-    delta_cv = last_cv - first_cv
-
-    if abs(delta_cv) < 0.01:
-        st.caption("El CV% se mantiene prácticamente estable entre el primer y el último mes mostrado.")
-    elif delta_cv < 0:
-        st.caption(
-            f"El CV% disminuyó {abs(delta_cv):.2f} puntos porcentuales entre "
-            "el primer y el último mes mostrado."
-        )
-    else:
-        st.caption(
-            f"El CV% aumentó {delta_cv:.2f} puntos porcentuales entre "
-            "el primer y el último mes mostrado."
-        )
+    fig.add_trace(go.Bar(x=monthly["mes"], y=monthly["cv"], name="CV%"))
+    fig.update_layout(height=360, title="CV% por mes", yaxis_title="CV%")
+    st.plotly_chart(fig, use_container_width=True, theme="streamlit", config={"displaylogo": False})
 
 
 def module_equipment(conn, user):
