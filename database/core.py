@@ -18,6 +18,7 @@ from typing import Any, Iterable, Optional
 import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 import streamlit as st
 
 def get_database_url() -> str:
@@ -33,7 +34,7 @@ def get_database_url() -> str:
 
 def get_connection():
     try:
-        return psycopg2.connect(
+        conn = psycopg2.connect(
             get_database_url(),
             connect_timeout=8,
             application_name="TMQuality",
@@ -41,7 +42,9 @@ def get_connection():
             keepalives_idle=30,
             keepalives_interval=10,
             keepalives_count=3,
+            options="-c idle_in_transaction_session_timeout=60000",
         )
+        return conn
     except Exception as exc:
         st.error("No fue posible conectar TMQuality con Supabase.")
         st.code(str(exc))
@@ -55,18 +58,69 @@ def execute(conn, sql: str, params: Optional[Iterable[Any]] = None, *, commit: b
         conn.commit()
 
 
+def _connection_is_idle(conn) -> bool:
+    """Indica si no existe una transacción PostgreSQL activa."""
+    try:
+        return conn.get_transaction_status() == TRANSACTION_STATUS_IDLE
+    except Exception:
+        return False
+
+
+def _finish_read_transaction(conn, started_idle: bool) -> None:
+    """Cierra solo la transacción de lectura iniciada por el helper.
+
+    psycopg2 abre una transacción incluso para un SELECT. Si no se realiza
+    COMMIT/ROLLBACK después de la lectura, PostgreSQL deja la sesión en
+    ``idle in transaction``. Eso puede mantener locks y bloquear ALTER TABLE,
+    migraciones o RLS.
+
+    Si el helper fue llamado dentro de una transacción ya existente,
+    ``started_idle`` será False y no se toca esa transacción.
+    """
+    if not started_idle or getattr(conn, "closed", True):
+        return
+    try:
+        conn.rollback()
+    except Exception:
+        # Si la conexión ya fue invalidada, el siguiente acceso gestionará
+        # el error normalmente.
+        pass
+
+
 def fetchone(conn, sql: str, params: Optional[Iterable[Any]] = None) -> Optional[dict]:
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, tuple(params or ()))
-        row = cur.fetchone()
-    return dict(row) if row else None
+    started_idle = _connection_is_idle(conn)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, tuple(params or ()))
+            row = cur.fetchone()
+        return dict(row) if row else None
+    except Exception:
+        if started_idle and not getattr(conn, "closed", True):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        _finish_read_transaction(conn, started_idle)
 
 
 def fetchall_df(conn, sql: str, params: Optional[Iterable[Any]] = None) -> pd.DataFrame:
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, tuple(params or ()))
-        rows = cur.fetchall()
-    return pd.DataFrame([dict(r) for r in rows])
+    started_idle = _connection_is_idle(conn)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, tuple(params or ()))
+            rows = cur.fetchall()
+        return pd.DataFrame([dict(r) for r in rows])
+    except Exception:
+        if started_idle and not getattr(conn, "closed", True):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        _finish_read_transaction(conn, started_idle)
 
 
 def _column_exists(conn, table: str, column: str) -> bool:
@@ -497,6 +551,7 @@ def ensure_database_ready(database_url: str) -> bool:
         database_url,
         connect_timeout=8,
         application_name="TMQuality-schema",
+        options="-c idle_in_transaction_session_timeout=60000",
     )
     try:
         init_db(conn)
